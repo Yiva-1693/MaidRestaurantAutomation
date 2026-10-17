@@ -1,0 +1,1114 @@
+package com.icewolf.maidrestaurant.automation.core;
+
+import com.github.tartaricacid.touhoulittlemaid.entity.passive.EntityMaid;
+import com.icewolf.maidrestaurant.automation.MaidRestaurantAutomation;
+import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.WeakHashMap;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.resources.ResourceLocation;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.Mob;
+import net.minecraft.world.entity.ai.Brain;
+import net.minecraft.world.entity.ai.memory.MemoryModuleType;
+import net.minecraft.world.entity.ai.memory.WalkTarget;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.Vec3;
+import net.minecraftforge.items.IItemHandler;
+import net.minecraftforge.items.ItemHandlerHelper;
+import net.minecraftforge.registries.ForgeRegistries;
+
+public class MaidUtils {
+    private static Method GET_AVAILABLE_INV;
+    private static Method GET_TASK;
+    private static boolean init;
+    public static final String TASK_COOK = "maid_restaurant:cook";
+    public static final String TASK_WAITER = "maid_restaurant:waiter";
+    private static final Set<EntityMaid> occupiedMaids;
+    
+    // 女仆任务跟踪（用于卡住自愈和员工人数统计）
+    private static final Map<UUID, MaidTaskInfo> taskTracker = new HashMap<>();
+
+    // 自愈去抖：女仆首次疑似"空闲卡住/幽灵忙碌"的 gameTime，必须连续无在制信号达到宽限才重置
+    // 10 秒宽限用于过滤烹饪在"两份请求之间 / 站定交互 / 坐凳前后"的合法瞬时空档，避免误打断做菜
+    private static final long SELF_HEAL_GRACE_TICKS = 200L;
+    private static final Map<UUID, Long> idleSuspectSince = new HashMap<>();
+    private static final Map<UUID, Long> ghostSuspectSince = new HashMap<>();
+
+    /**
+     * 服务器启动时清空女仆占用、任务跟踪与自愈嫌疑状态（见 {@link RuntimeState}）。
+     * maidBindings / maidBindingSources 由女仆饰品（持久化）推导、重进后仍有效，保留并会被定期校准。
+     */
+    public static void clearRuntimeState() {
+        occupiedMaids.clear();
+        taskTracker.clear();
+        idleSuspectSince.clear();
+        ghostSuspectSince.clear();
+    }
+
+    // 女仆与打单机的绑定关系（通过健康证或公示栏绑定）
+    private static final Map<UUID, BlockPos> maidBindings = new HashMap<>();
+    // 绑定来源记录（用于调试和去重）
+    private static final Map<UUID, String> maidBindingSources = new HashMap<>();
+    
+    public static class MaidTaskInfo {
+        public long startTime;
+        public double startX, startY, startZ;
+        public BlockPos machinePos; // 所属打单机
+        public String taskType; // "delivery", "cooking", "packaging", "dishwashing"
+        
+        public MaidTaskInfo(long startTime, double x, double y, double z, BlockPos machinePos, String taskType) {
+            this.startTime = startTime;
+            this.startX = x;
+            this.startY = y;
+            this.startZ = z;
+            this.machinePos = machinePos;
+            this.taskType = taskType;
+        }
+    }
+
+    private static void init() {
+        if (init) {
+            return;
+        }
+        try {
+            for (Method m : EntityMaid.class.getMethods()) {
+                if (!m.getName().equals("getAvailableInv")) continue;
+                GET_AVAILABLE_INV = m;
+                break;
+            }
+            for (Method m : EntityMaid.class.getMethods()) {
+                if (!m.getName().equals("getTask") || m.getParameterCount() != 0) continue;
+                GET_TASK = m;
+                break;
+            }
+        }
+        catch (Throwable t) {
+            MaidRestaurantAutomation.LOGGER.warn("MaidUtils: maid methods failed: {}", t.toString());
+        }
+        init = true;
+    }
+
+    public static double getX(Entity e) {
+        return e.getX();
+    }
+
+    public static double getY(Entity e) {
+        return e.getY();
+    }
+
+    public static double getZ(Entity e) {
+        return e.getZ();
+    }
+
+    public static String getTaskUid(EntityMaid maid) {
+        MaidUtils.init();
+        try {
+            Object task = GET_TASK.invoke(maid, new Object[0]);
+            if (task == null) {
+                return null;
+            }
+            Method getUid = task.getClass().getMethod("getUid", new Class[0]);
+            Object uid = getUid.invoke(task, new Object[0]);
+            return uid != null ? uid.toString() : null;
+        }
+        catch (Throwable t) {
+            return null;
+        }
+    }
+
+    public static boolean isCookMaid(EntityMaid maid) {
+        return TASK_COOK.equals(MaidUtils.getTaskUid(maid));
+    }
+
+    public static boolean isWaiterMaid(EntityMaid maid) {
+        return TASK_WAITER.equals(MaidUtils.getTaskUid(maid));
+    }
+
+    public static IItemHandler getInventory(EntityMaid maid) {
+        MaidUtils.init();
+        try {
+            Object inv = GET_AVAILABLE_INV.invoke(maid, true);
+            if (inv instanceof IItemHandler) {
+                IItemHandler handler = (IItemHandler)inv;
+                return handler;
+            }
+        }
+        catch (Throwable t) {
+            MaidRestaurantAutomation.LOGGER.error("MaidUtils: getInventory failed", t);
+        }
+        return null;
+    }
+
+    public static boolean isNear(EntityMaid maid, BlockPos target, double range) {
+        double dz;
+        double dy;
+        double dx = MaidUtils.getX((Entity)maid) - ((double)target.getX() + 0.5);
+        return dx * dx + (dy = MaidUtils.getY((Entity)maid) - (double)target.getY()) * dy + (dz = MaidUtils.getZ((Entity)maid) - ((double)target.getZ() + 0.5)) * dz < range * range;
+    }
+
+    public static boolean moveTo(EntityMaid maid, BlockPos target, double speed) {
+        try {
+            // 使用 Brain Memory 系统寻路，与女仆餐厅保持一致
+            // 到达距离为 1 格，确保女仆能精确到达目标位置
+            maid.getBrain().setMemory(MemoryModuleType.WALK_TARGET, new WalkTarget(target, (float)speed, 1));
+            return true;
+        }
+        catch (Throwable t) {
+            // Brain Memory 失败时回退到原版寻路
+            try {
+                return maid.getNavigation().moveTo((double)target.getX() + 0.5, target.getY(), (double)target.getZ() + 0.5, speed);
+            } catch (Throwable t2) {
+                return false;
+            }
+        }
+    }
+
+    public static boolean moveToSide(EntityMaid maid, BlockPos target, double speed) {
+        try {
+            // 对齐女仆餐厅本体（MaidGetFromStorageTask / BehaviorUtils.setWalkTargetMemory）：
+            // WALK_TARGET 直接设为「目标方块本身」、到达距离 0，由车万 Brain 的 WalkToTarget
+            // 行为驱动 navigation 自行找路。对实心方块 / 高差 / 四周被围的目标，navigation 会
+            // 自动停在最近的可达相邻格（含下方或隔层）。旧实现只枚举「与目标同层、脚下有支撑」
+            // 的侧面，对厨房站（比女仆高 1 格、水平侧脚下悬空）会算出 bestSide=null，女仆原地不动。
+            // 是否真正到达由调用方统一用 isNear(maid, target, closeEnough) 判定。
+            maid.getBrain().setMemory(MemoryModuleType.WALK_TARGET,
+                    new WalkTarget(target, (float) speed, 0));
+            return true;
+        }
+        catch (Throwable t) {
+            MaidRestaurantAutomation.LOGGER.error("MaidUtils: moveToSide failed to {}", target, t);
+            // 回退到原版寻路
+            try {
+                return maid.getNavigation().moveTo((double)target.getX() + 0.5, target.getY(), (double)target.getZ() + 0.5, speed);
+            } catch (Throwable t2) {
+                return false;
+            }
+        }
+    }
+
+    public static void resetMaidState(ServerLevel level, EntityMaid maid) {
+        try {
+            // 1. 从椅子上下来
+            try {
+                Class<?> behaviorUtils = Class.forName("com.mastermarisa.maid_restaurant.utils.BehaviorUtils");
+                java.lang.reflect.Method stopRide = behaviorUtils.getMethod("stopRide", net.minecraft.world.level.Level.class, EntityMaid.class);
+                stopRide.invoke(null, level, maid);
+            } catch (Throwable t) {
+                MaidRestaurantAutomation.LOGGER.warn("resetMaidState: stopRide failed", t);
+            }
+            // 2. 清除目标位置
+            try {
+                Class<?> behaviorUtils = Class.forName("com.mastermarisa.maid_restaurant.utils.BehaviorUtils");
+                java.lang.reflect.Method eraseTargetPos = behaviorUtils.getMethod("eraseTargetPos", net.minecraft.world.entity.LivingEntity.class);
+                eraseTargetPos.invoke(null, maid);
+            } catch (Throwable t) {
+                MaidRestaurantAutomation.LOGGER.warn("resetMaidState: eraseTargetPos failed", t);
+            }
+            // 3. 清除大脑记忆
+            try {
+                Brain<?> brain = maid.getBrain();
+                brain.eraseMemory(MemoryModuleType.WALK_TARGET);
+                brain.eraseMemory(MemoryModuleType.PATH);
+                brain.eraseMemory(MemoryModuleType.LOOK_TARGET);
+            } catch (Throwable t) {
+                MaidRestaurantAutomation.LOGGER.warn("resetMaidState: erase brain memories failed", t);
+            }
+            // 4. 清除女仆餐厅的记忆模块（CHAIR_POS, CACHED_WORK_BLOCK）。
+            //    这两个字段由 DeferredRegister 持有（RegistryObject），必须 .get() 取出真正的
+            //    MemoryModuleType；旧反射 field.get(null) 拿到的是 RegistryObject 包裹对象，
+            //    instanceof MemoryModuleType 恒为 false，导致自愈时厨凳/工作位记忆从未被擦除。
+            try {
+                maid.getBrain().eraseMemory(com.mastermarisa.maid_restaurant.init.ModEntities.CHAIR_POS.get());
+                maid.getBrain().eraseMemory(com.mastermarisa.maid_restaurant.init.ModEntities.CACHED_WORK_BLOCK.get());
+            } catch (Throwable t) {
+                MaidRestaurantAutomation.LOGGER.warn("resetMaidState: erase restaurant memory failed", t);
+            }
+            // 5. 停止导航
+            try {
+                maid.getNavigation().stop();
+            } catch (Throwable t) {}
+            // 6. 释放BlockUsageManager中女仆对所有块的使用
+            try {
+                Class<?> blockUsageManager = Class.forName("com.mastermarisa.maid_restaurant.utils.BlockUsageManager");
+                java.lang.reflect.Field blockUsageField = blockUsageManager.getDeclaredField("blockUsage");
+                blockUsageField.setAccessible(true);
+                Object blockUsageMap = blockUsageField.get(null);
+                if (blockUsageMap instanceof java.util.Map) {
+                    java.util.Map<?, ?> map = (java.util.Map<?, ?>) blockUsageMap;
+                    UUID maidUUID = maid.getUUID();
+                    int released = 0;
+                    for (Object key : new ArrayList<>(map.keySet())) {
+                        try {
+                            Long posLong = (Long) key;
+                            BlockPos pos = BlockPos.of(posLong);
+                            java.lang.reflect.Method removeUser = blockUsageManager.getMethod("removeUser", BlockPos.class, UUID.class);
+                            removeUser.invoke(null, pos, maidUUID);
+                            released++;
+                        } catch (Throwable t) {}
+                    }
+                    if (released > 0) {
+                    }
+                }
+            } catch (Throwable t) {
+                MaidRestaurantAutomation.LOGGER.warn("resetMaidState: release BlockUsageManager failed", t);
+            }
+            // 7. 清除女仆的所有烹饪请求（避免残留请求导致卡死）
+            try {
+                Class<?> requestManager = Class.forName("com.mastermarisa.maid_restaurant.utils.RequestManager");
+                Class<?> cookRequestHandlerClass = Class.forName("com.mastermarisa.maid_restaurant.request.CookRequestHandler");
+                java.lang.reflect.Method getOrCreate = cookRequestHandlerClass.getMethod("getOrCreate", EntityMaid.class);
+                Object handler = getOrCreate.invoke(null, maid);
+                if (handler != null) {
+                    java.lang.reflect.Method sizeMethod = handler.getClass().getMethod("size");
+                    int size = (Integer) sizeMethod.invoke(handler);
+                    if (size > 0) {
+                        for (int i = size - 1; i >= 0; i--) {
+                            try {
+                                java.lang.reflect.Method removeAt = handler.getClass().getMethod("removeAt", int.class);
+                                removeAt.invoke(handler, i);
+                            } catch (Throwable t) {}
+                        }
+                    }
+                }
+            } catch (Throwable t) {
+                MaidRestaurantAutomation.LOGGER.warn("resetMaidState: clear cook requests failed", t);
+            }
+            // 7.5 清除女仆餐厅的残留送餐请求（ServeRequest），避免 MaitServeMealTask
+            //     在配送/任务结束后仍从残留请求把女仆重新设回 WALK_TARGET 走向配送点。
+            //     （BlockUsageManager 已在步骤6统一释放，这里对每条请求的目标位再做一次保险释放）
+            try {
+                Class<?> requestManager = Class.forName("com.mastermarisa.maid_restaurant.utils.RequestManager");
+                Class<?> serveRequestClass = Class.forName("com.mastermarisa.maid_restaurant.request.ServeRequest");
+                int serveType = serveRequestClass.getField("TYPE").getInt(null);
+                java.lang.reflect.Method pop = requestManager.getMethod("pop", EntityMaid.class, int.class);
+                Class<?> blockUsageManager = Class.forName("com.mastermarisa.maid_restaurant.utils.BlockUsageManager");
+                java.lang.reflect.Method removeUser = blockUsageManager.getMethod("removeUser", BlockPos.class, UUID.class);
+                UUID maidUUID = maid.getUUID();
+                Object req;
+                int guard = 0;
+                while (guard++ < 64 && (req = pop.invoke(null, maid, serveType)) != null) {
+                    try {
+                        java.util.List<?> targets = (java.util.List<?>) serveRequestClass.getField("targets").get(req);
+                        if (targets != null) {
+                            for (Object t : targets) {
+                                removeUser.invoke(null, (BlockPos) t, maidUUID);
+                            }
+                        }
+                    } catch (Throwable ignore) {}
+                }
+            } catch (Throwable t) {
+                MaidRestaurantAutomation.LOGGER.warn("resetMaidState: clear serve requests failed", t);
+            }
+            // 8. 最彻底的重置：强制停止骑行、清除所有大脑记忆、重置AI状态
+            try {
+                maid.stopRiding();
+            } catch (Throwable t) {}
+            try {
+                // 清除所有大脑记忆（用反射调用removeAllMemories）
+                java.lang.reflect.Method removeAllMemories = maid.getBrain().getClass().getMethod("removeAllMemories");
+                removeAllMemories.invoke(maid.getBrain());
+            } catch (Throwable t) {
+                // 如果removeAllMemories不存在，逐个清除关键记忆
+                try {
+                    Brain<?> brain = maid.getBrain();
+                    brain.eraseMemory(MemoryModuleType.WALK_TARGET);
+                    brain.eraseMemory(MemoryModuleType.PATH);
+                    brain.eraseMemory(MemoryModuleType.LOOK_TARGET);
+                    brain.eraseMemory(MemoryModuleType.ATTACK_TARGET);
+                    brain.eraseMemory(MemoryModuleType.INTERACTION_TARGET);
+                } catch (Throwable t2) {}
+            }
+            try {
+                // 重置AI状态（setNoAi(true)然后false，强制AI重新评估）
+                maid.setNoAi(true);
+                maid.setNoAi(false);
+            } catch (Throwable t) {}
+            // 9. 重置女仆餐厅的任务检查速率（参考MaidCookingTask.stop），确保下一个任务能被正确检测
+            try {
+                Class<?> checkRateManager = Class.forName("com.mastermarisa.maid_restaurant.utils.CheckRateManager");
+                java.lang.reflect.Method setNextCheckTick = checkRateManager.getMethod("setNextCheckTick", String.class, int.class);
+                UUID maidUUID = maid.getUUID();
+                setNextCheckTick.invoke(null, maidUUID + "ApproachCookBlock", 0);
+                setNextCheckTick.invoke(null, maidUUID + "GetFromStorage", 0);
+            } catch (Throwable t) {
+                MaidRestaurantAutomation.LOGGER.warn("resetMaidState: reset CheckRateManager failed", t);
+            }
+            // 10. 解除经营模组的忙碌标记（防止任务异常结束后女仆一直卡住）
+            try {
+                if (MaidUtils.isOccupied(maid)) {
+                    MaidUtils.setOccupied(maid, false);
+                }
+            } catch (Throwable t) {}
+        } catch (Throwable t) {
+            MaidRestaurantAutomation.LOGGER.error("resetMaidState: failed", t);
+        }
+    }
+
+    public static boolean isOccupied(EntityMaid maid) {
+        return occupiedMaids.contains(maid);
+    }
+
+    public static void setOccupied(EntityMaid maid, boolean occupied) {
+        if (occupied) {
+            occupiedMaids.add(maid);
+        } else {
+            occupiedMaids.remove(maid);
+            // 清除任务跟踪
+            taskTracker.remove(maid.getUUID());
+        }
+    }
+    
+    /**
+     * 检查女仆是否有任务跟踪记录
+     */
+    public static boolean hasTaskTracker(UUID maidUUID) {
+        return taskTracker.containsKey(maidUUID);
+    }
+    
+    /**
+     * 标记女仆开始执行任务（记录任务信息用于卡住检测和人数统计）
+     */
+    public static void startTask(EntityMaid maid, BlockPos machinePos, String taskType, long currentTick) {
+        taskTracker.put(maid.getUUID(), new MaidTaskInfo(
+            currentTick,
+            MaidUtils.getX((Entity)maid),
+            MaidUtils.getY((Entity)maid),
+            MaidUtils.getZ((Entity)maid),
+            machinePos,
+            taskType
+        ));
+    }
+    
+    /**
+     * 检测卡住的女仆并自动重置
+     * @param stuckTimeoutTicks 卡住超时时间（tick，默认600=30秒）
+     * @param minMoveDistance 最小移动距离（方块，小于此值视为卡住）
+     * @return 被重置的女仆数量
+     */
+    public static int checkAndResetStuckMaids(ServerLevel level, long currentTick, int stuckTimeoutTicks, double minMoveDistance) {
+        if (taskTracker.isEmpty()) return 0;
+        
+        int resetCount = 0;
+        List<UUID> toRemove = new ArrayList<>();
+        
+        for (Map.Entry<UUID, MaidTaskInfo> entry : taskTracker.entrySet()) {
+            UUID maidUUID = entry.getKey();
+            MaidTaskInfo info = entry.getValue();
+            
+            // 检查任务是否超时
+            if (currentTick - info.startTime < stuckTimeoutTicks) continue;
+            
+            // 找到女仆实体
+            Entity maidEntity = null;
+            for (ServerLevel lvl : level.getServer().getAllLevels()) {
+                maidEntity = lvl.getEntity(maidUUID);
+                if (maidEntity != null) break;
+            }
+            
+            if (maidEntity == null || !(maidEntity instanceof EntityMaid)) {
+                toRemove.add(maidUUID);
+                continue;
+            }
+            
+            EntityMaid maid = (EntityMaid) maidEntity;
+            
+            // 检查女仆是否移动了
+            double currentX = MaidUtils.getX((Entity)maid);
+            double currentY = MaidUtils.getY((Entity)maid);
+            double currentZ = MaidUtils.getZ((Entity)maid);
+            double moveDist = Math.sqrt(
+                (currentX - info.startX) * (currentX - info.startX) +
+                (currentY - info.startY) * (currentY - info.startY) +
+                (currentZ - info.startZ) * (currentZ - info.startZ)
+            );
+            
+            if (moveDist < minMoveDistance) {
+                // 重要：在重置前，先检查女仆是否正在烹饪
+                // 如果女仆正在烹饪（有CookRequest或坐在椅子上），不要重置她，延长检测时间
+                boolean isMaidCooking = false;
+                try {
+                    com.mastermarisa.maid_restaurant.request.CookRequest cookReq = 
+                        (com.mastermarisa.maid_restaurant.request.CookRequest)
+                        com.mastermarisa.maid_restaurant.utils.RequestManager.peek(maid, 0);
+                    if (cookReq != null) {
+                        isMaidCooking = true;
+                    }
+                } catch (Throwable t) {}
+                if (maid.isPassenger()) {
+                    isMaidCooking = true;
+                }
+                
+                if (isMaidCooking) {
+                    // 女仆正在烹饪，延长检测时间（更新起始位置和时间）
+                    info.startX = currentX;
+                    info.startY = currentY;
+                    info.startZ = currentZ;
+                    info.startTime = currentTick;
+                } else {
+                    // 女仆确实卡住了，重置（日志节流，10秒一条，动作每次执行）
+                    if (com.icewolf.maidrestaurant.automation.util.LogThrottle.allow(
+                            "stuck_selfheal:" + maid.getUUID(), currentTick)) {
+                        MaidRestaurantAutomation.LOGGER.warn("女仆卡住自愈: 女仆 {} 任务类型={} 超时{}tick 仅移动{}方块，正在重置",
+                            maid.getName().getString(), info.taskType, currentTick - info.startTime, moveDist);
+                    }
+                    MaidUtils.resetMaidState(level, maid);
+                    resetCount++;
+                }
+            } else {
+                // 女仆在移动，更新起始位置（延长检测）
+                info.startX = currentX;
+                info.startY = currentY;
+                info.startZ = currentZ;
+                info.startTime = currentTick;
+            }
+        }
+        
+        for (UUID uuid : toRemove) {
+            taskTracker.remove(uuid);
+        }
+        
+        return resetCount;
+    }
+    
+    /**
+     * 检查某台打单机是否还能接受新的女仆工作。
+     *
+     * <p>工位制（新 mod）：不再限制每店员工人数——员工上限由实际认领到的工位数决定，
+     * 因此这里恒为 true；"未认领 = 不可接单"由调度显示器工位过滤在派单侧完成。</p>
+     */
+    public static boolean canAcceptWorker(ServerLevel level, BlockPos machinePos) {
+        return true;
+    }
+
+    // ==================== 旧"健康证 / 公告板"员工绑定（已随该功能移除） ====================
+    // 以下方法保留签名以兼容既有调用点，但员工绑定语义已由调度显示器工位绑定（DispatcherManager）取代。
+    // 健康证与公告板删除后不再有"女仆 ↔ 打单机"的旧式持久绑定表。
+
+    /** @deprecated 旧员工绑定已废弃，由调度显示器工位绑定取代。 */
+    @Deprecated
+    public static void bindMaidToMachine(UUID maidUUID, BlockPos machinePos, String source) {
+    }
+
+    /** @deprecated 旧员工绑定已废弃。 */
+    @Deprecated
+    public static void unbindMaid(UUID maidUUID, String source) {
+    }
+
+    /** @deprecated 旧员工绑定已废弃。 */
+    @Deprecated
+    public static BlockPos getBoundMachine(UUID maidUUID) {
+        return null;
+    }
+
+    /** @deprecated 旧员工绑定已废弃：改用 {@link DispatcherManager#findBinding}。 */
+    @Deprecated
+    public static boolean isMaidBoundToMachine(UUID maidUUID, BlockPos machinePos) {
+        return false;
+    }
+
+    /** @deprecated 旧员工绑定已废弃：返回 0 使各 Bridge 旧的"绑定优先"分支自动停用。 */
+    @Deprecated
+    public static int getWorkerCountForMachine(BlockPos machinePos) {
+        return 0;
+    }
+
+    /** @deprecated 旧员工绑定已废弃。 */
+    @Deprecated
+    public static void cleanupInvalidBindings(ServerLevel level) {
+    }
+
+    /** @deprecated 健康证已移除，无需再从饰品栏维护绑定。 */
+    @Deprecated
+    public static void updateBindingsFromBaubles(ServerLevel level) {
+    }
+
+    /**
+     * 检测被标记为不忙碌但AI状态卡住的女仆（任务清理不彻底导致的）
+     * 这种女仆isOccupied=false，但isMaidBusy=true（大脑中还有WALK_TARGET或PATH记忆）
+     * 两类判定都加入连续 {@link #SELF_HEAL_GRACE_TICKS} 宽限期：
+     * 烹饪在"两份请求之间 / 站定交互 / 坐凳前后"会短暂没有请求和导航，属于合法空档，
+     * 必须连续约10秒查不到任何在制信号才重置，避免误打断正在做的菜。
+     * @return 被重置的女仆数量
+     */
+    public static int checkAndResetIdleStuckMaids(ServerLevel level) {
+        int resetCount = 0;
+        try {
+            // 使用TaskManager的缓存女仆列表，避免无限大AABB搜索导致多人服务器性能问题
+            List<EntityMaid> allMaids = TaskManager.getInstance().getCachedMaids(level);
+            long now = level.getGameTime();
+
+            for (EntityMaid maid : allMaids) {
+                if (maid == null || !maid.isAlive()) continue;
+                UUID maidUUID = maid.getUUID();
+
+                // 检测1：被标记为不忙碌，但大脑残留行走/路径记忆
+                if (!isOccupied(maid)) {
+                    if (isMaidBusy(maid) && !isMaidActuallyWorking(maid, level)) {
+                        Long first = idleSuspectSince.get(maidUUID);
+                        if (first == null) {
+                            // 首次疑似，进入宽限，不立即重置
+                            idleSuspectSince.put(maidUUID, now);
+                        } else if (now - first >= SELF_HEAL_GRACE_TICKS) {
+                            if (com.icewolf.maidrestaurant.automation.util.LogThrottle.allow(
+                                    "idle_stuck_selfheal:" + maidUUID, now)) {
+                                MaidRestaurantAutomation.LOGGER.warn("女仆空闲卡住自愈: 女仆 {} 被标记为不忙碌但AI状态卡住（持续{}tick），正在重置",
+                                    maid.getName().getString(), now - first);
+                            }
+                            resetMaidState(level, maid);
+                            idleSuspectSince.remove(maidUUID);
+                            ghostSuspectSince.remove(maidUUID);
+                            resetCount++;
+                        }
+                    } else {
+                        idleSuspectSince.remove(maidUUID);
+                    }
+                    continue;
+                }
+
+                // 检测2：被标记为忙碌，但查不到任何在制任务/烹饪/导航信号（任务异常结束）
+                if (!isMaidActuallyWorking(maid, level)) {
+                    Long first = ghostSuspectSince.get(maidUUID);
+                    if (first == null) {
+                        // 首次疑似，进入宽限（烹饪阶段切换/请求间隙是合法瞬时状态）
+                        ghostSuspectSince.put(maidUUID, now);
+                    } else if (now - first >= SELF_HEAL_GRACE_TICKS) {
+                        if (com.icewolf.maidrestaurant.automation.util.LogThrottle.allow(
+                                "ghost_busy_selfheal:" + maidUUID, now)) {
+                            MaidRestaurantAutomation.LOGGER.warn("女仆幽灵忙碌自愈: 女仆 {} 被标记为忙碌但持续{}tick无任何任务/烹饪/导航信号，清理忙碌标记",
+                                maid.getName().getString(), now - first);
+                        }
+                        setOccupied(maid, false);
+                        // 同时调用TaskSafetyUtils彻底重置女仆状态
+                        try {
+                            Class<?> safetyUtils = Class.forName("com.icewolf.maidrestaurant.automation.core.TaskSafetyUtils");
+                            java.lang.reflect.Method resetMethod = safetyUtils.getMethod("resetMaidState", EntityMaid.class);
+                            resetMethod.invoke(null, maid);
+                        } catch (Throwable t) {
+                            if (com.icewolf.maidrestaurant.automation.util.LogThrottle.allow(
+                                    "ghost_selfheal_reset_fail:" + maidUUID, now)) {
+                                MaidRestaurantAutomation.LOGGER.warn("女仆幽灵忙碌自愈: 调用TaskSafetyUtils.resetMaidState失败", t);
+                            }
+                        }
+                        ghostSuspectSince.remove(maidUUID);
+                        idleSuspectSince.remove(maidUUID);
+                        resetCount++;
+                    }
+                } else {
+                    // 确实在工作，清除疑似记录
+                    ghostSuspectSince.remove(maidUUID);
+                }
+            }
+        } catch (Throwable t) {
+            MaidRestaurantAutomation.LOGGER.error("检测空闲卡住女仆时异常", t);
+        }
+        return resetCount;
+    }
+
+    /**
+     * 多信号判断女仆当前是否确实有任务/烹饪在身，供自愈判定使用。
+     * 覆盖烹饪在阶段切换、站定交互、坐凳前后等"导航与请求瞬时为空"的合法空档。
+     * 注意：不把大脑残留的 WALK_TARGET/PATH 记忆计入在制信号，否则空闲卡住检测会失效。
+     */
+    private static boolean isMaidActuallyWorking(EntityMaid maid, ServerLevel level) {
+        if (maid == null) return false;
+        UUID uuid = maid.getUUID();
+        // 1. TaskManager 活跃任务（营业中烹饪每 tick 心跳，最可靠）
+        try {
+            if (TaskManager.getInstance().hasMaidTask(uuid)) return true;
+        } catch (Throwable t) {}
+        // 2. 旧任务跟踪记录
+        if (taskTracker.containsKey(uuid)) return true;
+        // 3. 持久化的营业任务标记（送餐/打包/洗碗/收盘/取单/接待/烹饪）
+        try {
+            net.minecraft.nbt.CompoundTag data = maid.getPersistentData();
+            if (data.contains("BusinessDeliverCounter") || data.contains("BusinessPackCounter")
+                || data.contains("BusinessWashCounter") || data.contains("BusinessCookCounter")
+                || data.contains("BusinessCollectPlate") || data.contains("BusinessFetchMachine")
+                || data.contains("BusinessGreetNpc")) {
+                return true;
+            }
+        } catch (Throwable t) {}
+        // 4. 女仆餐厅烹饪请求（peek 类型 0 = CookRequest）
+        try {
+            if (com.mastermarisa.maid_restaurant.utils.RequestManager.peek(maid, 0) != null) return true;
+        } catch (Throwable t) {}
+        // 5. 骑乘 / 坐在厨凳上
+        try {
+            if (maid.isPassenger()) return true;
+        } catch (Throwable t) {}
+        // 6. 导航正在执行（真在走路，区别于大脑残留记忆）
+        try {
+            if (maid.getNavigation().isInProgress()) return true;
+        } catch (Throwable t) {}
+        // 7. 女仆餐厅烹饪大脑信号：目标厨具位 / 餐椅位 / 烹饪状态 COOK
+        try {
+            Brain<?> brain = maid.getBrain();
+            if (brain.hasMemoryValue(com.mastermarisa.maid_restaurant.init.ModEntities.TARGET_POS.get())
+                || brain.hasMemoryValue(com.mastermarisa.maid_restaurant.init.ModEntities.CHAIR_POS.get())) {
+                return true;
+            }
+            if (com.mastermarisa.maid_restaurant.utils.MaidStateManager.cookState(maid, level)
+                    == com.mastermarisa.maid_restaurant.utils.MaidStateManager.CookState.COOK) {
+                return true;
+            }
+        } catch (Throwable t) {}
+        return false;
+    }
+
+    public static boolean isMaidBusy(EntityMaid maid) {
+        if (MaidUtils.isOccupied(maid)) {
+            return true;
+        }
+        try {
+            Brain brain = maid.getBrain();
+            MemoryModuleType walkTarget = MemoryModuleType.WALK_TARGET;
+            if (brain.hasMemoryValue(walkTarget)) {
+                return true;
+            }
+            MemoryModuleType path = MemoryModuleType.PATH;
+            if (brain.hasMemoryValue(path)) {
+                return true;
+            }
+        }
+        catch (Throwable throwable) {
+            // empty catch block
+        }
+        return false;
+    }
+
+    /**
+     * 判断目标是否全部在女仆的工作半径内（与女仆餐厅本体同源，直接调用 TLM 的
+     * EntityMaid.isWithinRestriction）。家模式下目标必须在工作点的限制半径内；
+     * 跟随模式（无限制）下恒为 true。任一目标在半径外即返回 false。
+     * 单个目标判断出错时不拦截（返回 true），避免 API 差异导致女仆完全无法派单。
+     */
+    public static boolean isWithinMaidRange(EntityMaid maid, BlockPos... targets) {
+        if (targets == null) return true;
+        for (BlockPos target : targets) {
+            if (target == null) continue;
+            try {
+                if (!maid.isWithinRestriction(target)) return false;
+            } catch (Throwable t) {
+                return true;
+            }
+        }
+        return true;
+    }
+
+    public static EntityMaid findMaid(ServerLevel level, BlockPos center, int range, String taskUid) {
+        List<EntityMaid> maids = (List)level.getEntitiesOfClass(EntityMaid.class, new AABB(center).inflate((double)range));
+        EntityMaid nearest = null;
+        double minDist = Double.MAX_VALUE;
+        for (EntityMaid m : maids) {
+            double dz;
+            double dy;
+            double dx;
+            double dist;
+            // 检查TaskManager任务：避免返回有卡住任务的女仆
+            if (TaskManager.getInstance().hasMaidTask(m.getUUID())) continue;
+            // 半径同源：目标必须在该女仆工作半径内，避免派了任务走不过去被拉回
+            if (!MaidUtils.isWithinMaidRange(m, center)) {
+                continue;
+            }
+            if (MaidUtils.isMaidBusy(m) || taskUid != null && !taskUid.equals(MaidUtils.getTaskUid(m)) || !((dist = (dx = MaidUtils.getX((Entity)m) - ((double)center.getX() + 0.5)) * dx + (dy = MaidUtils.getY((Entity)m) - (double)center.getY()) * dy + (dz = MaidUtils.getZ((Entity)m) - ((double)center.getZ() + 0.5)) * dz) < minDist)) continue;
+            minDist = dist;
+            nearest = m;
+        }
+        return nearest;
+    }
+
+    public static EntityMaid findWaiterMaid(ServerLevel level, BlockPos center, int range) {
+        return MaidUtils.findMaid(level, center, range, TASK_WAITER);
+    }
+
+    public static EntityMaid findCookMaid(ServerLevel level, BlockPos center, int range) {
+        return MaidUtils.findMaid(level, center, range, TASK_COOK);
+    }
+    
+    /**
+     * 查找绑定到指定打单机的侍者女仆
+     * 如果没有绑定女仆，返回null（由调用方决定是否回退到自动分配）
+     * 使用UUID查找女仆，避免getEntitiesOfClass在多模组环境中找不到女仆的问题
+     */
+    public static EntityMaid findBoundWaiterMaid(ServerLevel level, BlockPos center, int range, BlockPos machinePos) {
+        if (machinePos == null) return null;
+        
+        // 方式1：从maidBindings中获取绑定到该打单机的所有女仆UUID，用UUID查找
+        EntityMaid nearest = null;
+        double minDist = Double.MAX_VALUE;
+        int boundCount = 0;
+        int foundByUuid = 0;
+        int inRange = 0;
+        int isWaiter = 0;
+        int isFree = 0;
+        
+        for (Map.Entry<UUID, BlockPos> entry : maidBindings.entrySet()) {
+            if (entry.getValue() == null || !entry.getValue().equals(machinePos)) continue;
+            boundCount++;
+            UUID maidUUID = entry.getKey();
+            
+            // 用UUID在所有维度查找女仆
+            Entity maidEntity = null;
+            for (ServerLevel lvl : level.getServer().getAllLevels()) {
+                maidEntity = lvl.getEntity(maidUUID);
+                if (maidEntity != null) break;
+            }
+            if (maidEntity == null || !(maidEntity instanceof EntityMaid)) continue;
+            foundByUuid++;
+            
+            EntityMaid m = (EntityMaid) maidEntity;
+            // 检查是否在范围内
+            double dx = MaidUtils.getX((Entity)m) - ((double)center.getX() + 0.5);
+            double dy = MaidUtils.getY((Entity)m) - ((double)center.getY());
+            double dz = MaidUtils.getZ((Entity)m) - ((double)center.getZ() + 0.5);
+            double dist = dx * dx + dy * dy + dz * dz;
+            if (dist > (double)range * range) continue;
+            inRange++;
+            
+            // 检查是否是侍者职业
+            if (!TASK_WAITER.equals(MaidUtils.getTaskUid(m))) continue;
+            isWaiter++;
+            
+            // 半径同源：目标必须在该女仆工作半径内
+            if (!MaidUtils.isWithinMaidRange(m, center)) {
+                continue;
+            }
+            
+            // 检查是否忙碌
+            if (MaidUtils.isMaidBusy(m)) continue;
+            if (TaskManager.getInstance().hasMaidTask(m.getUUID())) continue;
+            isFree++;
+            
+            if (dist < minDist) {
+                minDist = dist;
+                nearest = m;
+            }
+        }
+        
+        // 方式2：如果UUID查找失败，回退到getEntitiesOfClass（兼容旧绑定）
+        if (nearest == null) {
+            List<EntityMaid> maids = (List)level.getEntitiesOfClass(EntityMaid.class, new AABB(center).inflate((double)range));
+            for (EntityMaid m : maids) {
+                if (MaidUtils.isMaidBusy(m)) continue;
+                if (TaskManager.getInstance().hasMaidTask(m.getUUID())) continue;
+                if (!TASK_WAITER.equals(MaidUtils.getTaskUid(m))) continue;
+                if (!isMaidBoundToMachine(m.getUUID(), machinePos)) continue;
+                if (!MaidUtils.isWithinMaidRange(m, center)) {
+                    continue;
+                }
+                double dx = MaidUtils.getX((Entity)m) - ((double)center.getX() + 0.5);
+                double dy = MaidUtils.getY((Entity)m) - ((double)center.getY());
+                double dz = MaidUtils.getZ((Entity)m) - ((double)center.getZ() + 0.5);
+                double dist = dx * dx + dy * dy + dz * dz;
+                if (dist < minDist) {
+                    minDist = dist;
+                    nearest = m;
+                }
+            }
+        }
+        
+        if (nearest == null) {
+        } else {
+        }
+        
+        return nearest;
+    }
+    
+    /**
+     * 查找绑定到指定打单机的厨师女仆
+     * 使用UUID查找女仆，避免getEntitiesOfClass在多模组环境中找不到女仆的问题
+     */
+    public static EntityMaid findBoundCookMaid(ServerLevel level, BlockPos center, int range, BlockPos machinePos) {
+        if (machinePos == null) return null;
+        
+        // 方式1：从maidBindings中获取绑定到该打单机的所有女仆UUID，用UUID查找
+        EntityMaid nearest = null;
+        double minDist = Double.MAX_VALUE;
+        int boundCount = 0;
+        int foundByUuid = 0;
+        int inRange = 0;
+        int isCook = 0;
+        int isFree = 0;
+        
+        for (Map.Entry<UUID, BlockPos> entry : maidBindings.entrySet()) {
+            if (entry.getValue() == null || !entry.getValue().equals(machinePos)) continue;
+            boundCount++;
+            UUID maidUUID = entry.getKey();
+            
+            // 用UUID在所有维度查找女仆
+            Entity maidEntity = null;
+            for (ServerLevel lvl : level.getServer().getAllLevels()) {
+                maidEntity = lvl.getEntity(maidUUID);
+                if (maidEntity != null) break;
+            }
+            if (maidEntity == null || !(maidEntity instanceof EntityMaid)) continue;
+            foundByUuid++;
+            
+            EntityMaid m = (EntityMaid) maidEntity;
+            // 检查是否在范围内
+            double dx = MaidUtils.getX((Entity)m) - ((double)center.getX() + 0.5);
+            double dy = MaidUtils.getY((Entity)m) - ((double)center.getY());
+            double dz = MaidUtils.getZ((Entity)m) - ((double)center.getZ() + 0.5);
+            double dist = dx * dx + dy * dy + dz * dz;
+            if (dist > (double)range * range) continue;
+            inRange++;
+            
+            // 检查是否是厨师职业
+            if (!TASK_COOK.equals(MaidUtils.getTaskUid(m))) continue;
+            isCook++;
+            
+            // 半径同源：目标必须在该女仆工作半径内
+            if (!MaidUtils.isWithinMaidRange(m, center)) {
+                continue;
+            }
+            
+            // 检查是否忙碌
+            if (MaidUtils.isMaidBusy(m)) continue;
+            if (TaskManager.getInstance().hasMaidTask(m.getUUID())) continue;
+            isFree++;
+            
+            if (dist < minDist) {
+                minDist = dist;
+                nearest = m;
+            }
+        }
+        
+        // 方式2：如果UUID查找失败，回退到getEntitiesOfClass（兼容旧绑定）
+        if (nearest == null) {
+            List<EntityMaid> maids = (List)level.getEntitiesOfClass(EntityMaid.class, new AABB(center).inflate((double)range));
+            for (EntityMaid m : maids) {
+                if (MaidUtils.isMaidBusy(m)) continue;
+                if (TaskManager.getInstance().hasMaidTask(m.getUUID())) continue;
+                if (!TASK_COOK.equals(MaidUtils.getTaskUid(m))) continue;
+                if (!isMaidBoundToMachine(m.getUUID(), machinePos)) continue;
+                if (!MaidUtils.isWithinMaidRange(m, center)) {
+                    continue;
+                }
+                double dx = MaidUtils.getX((Entity)m) - ((double)center.getX() + 0.5);
+                double dy = MaidUtils.getY((Entity)m) - ((double)center.getY());
+                double dz = MaidUtils.getZ((Entity)m) - ((double)center.getZ() + 0.5);
+                double dist = dx * dx + dy * dy + dz * dz;
+                if (dist < minDist) {
+                    minDist = dist;
+                    nearest = m;
+                }
+            }
+        }
+        
+        if (nearest == null) {
+        } else {
+        }
+        
+        return nearest;
+    }
+    
+    /**
+     * 智能查找女仆：如果有绑定到该打单机的女仆，只找绑定的；否则回退到自动分配（找最近的空闲女仆）
+     */
+    /**
+     * 在给定候选侍者中，挑选职业/绑定匹配、且工作半径覆盖"操作台 + 终点"的最近侍者。
+     * 专用于配送双目标：① 操作台永远要求在半径内（且在 range 内）；
+     * ② endPos 解析到了才要求在半径内；endPos 为 null（终点业务失败）时只看①，
+     * 让女仆走到操作台后由执行阶段的"找不到顾客/速递站"气泡处理。
+     */
+    public static EntityMaid pickSmartWaiterAmong(ServerLevel level, List<EntityMaid> candidates,
+            BlockPos counterPos, BlockPos endPos, int range, BlockPos machinePos) {
+        if (candidates == null || candidates.isEmpty() || counterPos == null) return null;
+        EntityMaid nearest = null;
+        double minDist = Double.MAX_VALUE;
+        boolean boundEnabled = machinePos != null && getWorkerCountForMachine(machinePos) > 0;
+        for (EntityMaid m : candidates) {
+            if (!TASK_WAITER.equals(getTaskUid(m))) continue;
+            // 绑定口径：有绑定员工时只选绑定到该打单机的
+            if (boundEnabled && !isMaidBoundToMachine(m.getUUID(), machinePos)) continue;
+            // 调度显示器工位制（开发文档 4.3②）：已放置调度显示器的餐厅里，未认领工位的侍者不可接单
+            if (machinePos != null
+                    && DispatcherManager.findForMachine(level, machinePos) != null
+                    && !DispatcherManager.isMaidClaimed(level, machinePos, m)) {
+                continue;
+            }
+            double dx = getX((Entity) m) - (counterPos.getX() + 0.5);
+            double dy = getY((Entity) m) - counterPos.getY();
+            double dz = getZ((Entity) m) - (counterPos.getZ() + 0.5);
+            double dist = dx * dx + dy * dy + dz * dz;
+            boolean counterOk = isWithinMaidRange(m, counterPos);
+            boolean endOk = (endPos == null) || isWithinMaidRange(m, endPos);
+            // ① 操作台：永远校验（范围 + 半径）
+            if (dist > (double) range * range) continue;
+            if (!counterOk) continue;
+            // ② 终点：仅在解析到（非 null）时校验
+            if (!endOk) continue;
+            if (dist < minDist) {
+                minDist = dist;
+                nearest = m;
+            }
+        }
+        return nearest;
+    }
+
+    public static EntityMaid findWaiterMaidSmart(ServerLevel level, BlockPos center, int range, BlockPos machinePos) {
+        // 调度显示器工位制：已放置调度显示器的餐厅里，只在"已认领工位"的侍者中挑选
+        if (machinePos != null && DispatcherManager.findForMachine(level, machinePos) != null) {
+            List<EntityMaid> claimed = new ArrayList<>();
+            double r2 = (double) range * range;
+            for (EntityMaid m : TaskManager.getInstance().getCachedMaids(level)) {
+                if (m == null || !m.isAlive()) continue;
+                if (!TASK_WAITER.equals(getTaskUid(m))) continue;
+                if (!DispatcherManager.isMaidClaimed(level, machinePos, m)) continue;
+                if (m.distanceToSqr(center.getX() + 0.5, center.getY(), center.getZ() + 0.5) > r2) continue;
+                claimed.add(m);
+            }
+            return pickSmartWaiterAmong(level, claimed, center, null, range, null);
+        }
+        if (machinePos != null && getWorkerCountForMachine(machinePos) > 0) {
+            EntityMaid bound = findBoundWaiterMaid(level, center, range, machinePos);
+            if (bound != null) return bound;
+            // 有绑定女仆但都在忙碌，返回null（不回退到非绑定女仆）
+            return null;
+        }
+        // 没有绑定女仆，回退到自动分配
+        return findWaiterMaid(level, center, range);
+    }
+    
+    public static EntityMaid findCookMaidSmart(ServerLevel level, BlockPos center, int range, BlockPos machinePos) {
+        // 调度显示器工位制：已放置调度显示器的餐厅里，只在"已认领工位"的厨师中挑选
+        if (machinePos != null && DispatcherManager.findForMachine(level, machinePos) != null) {
+            EntityMaid nearest = null;
+            double best = Double.MAX_VALUE;
+            double r2 = (double) range * range;
+            for (EntityMaid m : TaskManager.getInstance().getCachedMaids(level)) {
+                if (m == null || !m.isAlive()) continue;
+                if (!TASK_COOK.equals(getTaskUid(m))) continue;
+                if (!DispatcherManager.isMaidClaimed(level, machinePos, m)) continue;
+                double d = m.distanceToSqr(center.getX() + 0.5, center.getY(), center.getZ() + 0.5);
+                if (d > r2 || d >= best) continue;
+                best = d;
+                nearest = m;
+            }
+            return nearest;
+        }
+        if (machinePos != null && getWorkerCountForMachine(machinePos) > 0) {
+            EntityMaid bound = findBoundCookMaid(level, center, range, machinePos);
+            if (bound != null) return bound;
+            return null;
+        }
+        return findCookMaid(level, center, range);
+    }
+
+    public static int countItem(IItemHandler inv, ResourceLocation itemId) {
+        if (inv == null || itemId == null) {
+            return 0;
+        }
+        int count = 0;
+        for (int i = 0; i < inv.getSlots(); ++i) {
+            ResourceLocation rl;
+            ItemStack stack = inv.getStackInSlot(i);
+            if (stack.isEmpty() || !itemId.equals((Object)(rl = ForgeRegistries.ITEMS.getKey(stack.getItem())))) continue;
+            count += stack.getCount();
+        }
+        return count;
+    }
+
+    public static int takeItem(IItemHandler from, IItemHandler to, ResourceLocation itemId, int maxCount) {
+        if (from == null || to == null || itemId == null) {
+            return 0;
+        }
+        int taken = 0;
+        for (int i = 0; i < from.getSlots() && taken < maxCount; ++i) {
+            int toTake;
+            ItemStack extracted;
+            ResourceLocation rl;
+            ItemStack stack = from.getStackInSlot(i);
+            if (stack.isEmpty() || !itemId.equals((Object)(rl = ForgeRegistries.ITEMS.getKey(stack.getItem()))) || (extracted = from.extractItem(i, toTake = Math.min(stack.getCount(), maxCount - taken), false)).isEmpty()) continue;
+            ItemStack remainder = ItemHandlerHelper.insertItemStacked((IItemHandler)to, (ItemStack)extracted, (boolean)false);
+            taken += extracted.getCount() - remainder.getCount();
+            if (remainder.isEmpty()) continue;
+            from.insertItem(i, remainder, false);
+        }
+        return taken;
+    }
+
+    public static int transferFromMaid(EntityMaid maid, String itemId, int maxCount, IItemHandler target) {
+        IItemHandler maidInv = MaidUtils.getInventory(maid);
+        if (maidInv == null || target == null) {
+            return 0;
+        }
+        ResourceLocation rl = new ResourceLocation(itemId);
+        return MaidUtils.takeItem(maidInv, target, rl, maxCount);
+    }
+
+    // ========== 排班表配置检查 ==========
+    public static final int SCHED_AUTO_ENABLED = 0;
+    public static final int SCHED_AUTO_DELIVERY = 1;
+    public static final int SCHED_AUTO_PACKAGING = 2;
+    public static final int SCHED_AUTO_COOKING = 3;
+    public static final int SCHED_AUTO_PRE_COOKING = 4;
+    public static final int SCHED_AUTO_COLLECT = 5;
+    public static final int SCHED_AUTO_WASH = 6;
+    public static final int SCHED_AUTO_ACCEPT = 7;
+
+    /**
+     * 查找打单机附近16格内绑定了该打单机的排班表方块实体
+     * 只返回绑定了当前打单机的排班表，避免一个排班表影响多个打单机
+     */
+    public static com.icewolf.maidrestaurant.automation.block.entity.ScheduleBoardBlockEntity getNearbyScheduleBoard(ServerLevel level, BlockPos machinePos) {
+        if (level == null || machinePos == null) return null;
+        for (BlockPos pos : BlockPos.betweenClosed(machinePos.offset(-16, -8, -16), machinePos.offset(16, 8, 16))) {
+            net.minecraft.world.level.block.entity.BlockEntity be = level.getBlockEntity(pos);
+            if (be instanceof com.icewolf.maidrestaurant.automation.block.entity.ScheduleBoardBlockEntity) {
+                com.icewolf.maidrestaurant.automation.block.entity.ScheduleBoardBlockEntity board = (com.icewolf.maidrestaurant.automation.block.entity.ScheduleBoardBlockEntity) be;
+                // 只返回绑定了当前打单机的排班表
+                if (board.hasBoundMachine() && machinePos.equals(board.getBoundMachinePos())) {
+                    return board;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 检查打单机附近的排班表中指定配置是否启用
+     * 如果没有排班表，默认返回true（全部启用）
+     */
+    public static boolean isScheduleBoardEnabled(ServerLevel level, BlockPos machinePos, int configType) {
+        com.icewolf.maidrestaurant.automation.block.entity.ScheduleBoardBlockEntity board = getNearbyScheduleBoard(level, machinePos);
+        if (board == null) return true; // 没有排班表，默认全部启用
+        if (!board.isAutoEnabled()) return false; // 总开关关闭，全部禁用
+        switch (configType) {
+            case SCHED_AUTO_DELIVERY: return board.isAutoDelivery();
+            case SCHED_AUTO_PACKAGING: return board.isAutoPackaging();
+            case SCHED_AUTO_COOKING: return board.isAutoCooking();
+            case SCHED_AUTO_PRE_COOKING: return board.isAutoPreCooking();
+            case SCHED_AUTO_COLLECT: return board.isAutoCollect();
+            case SCHED_AUTO_WASH: return board.isAutoWash();
+            case SCHED_AUTO_ACCEPT: return board.isAutoAccept();
+            default: return true;
+        }
+    }
+
+    /**
+     * 获取排班表中的洗碗阈值
+     * 获取排班表的洗碗阈值
+     * 如果没有排班表，返回0（表示使用配置文件默认值）
+     */
+    public static int getScheduleBoardMinPlates(ServerLevel level, BlockPos machinePos) {
+        com.icewolf.maidrestaurant.automation.block.entity.ScheduleBoardBlockEntity board = getNearbyScheduleBoard(level, machinePos);
+        if (board == null) return 0;
+        return board.getMinPlatesToWash();
+    }
+
+    static {
+        init = false;
+        occupiedMaids = Collections.newSetFromMap(new WeakHashMap());
+    }
+}

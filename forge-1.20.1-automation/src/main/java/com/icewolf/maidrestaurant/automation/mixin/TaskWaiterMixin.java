@@ -1,0 +1,27 @@
+package com.icewolf.maidrestaurant.automation.mixin;
+
+import com.github.tartaricacid.touhoulittlemaid.entity.passive.EntityMaid;
+import com.google.common.collect.Lists;
+import com.icewolf.maidrestaurant.automation.MaidRestaurantAutomation;
+import com.mastermarisa.maid_restaurant.maid.task.TaskWaiter;
+import com.mojang.datafixers.util.Pair;
+import java.util.ArrayList;
+import java.util.List;
+import net.minecraft.world.entity.ai.behavior.BehaviorControl;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+@Mixin(value={TaskWaiter.class})
+public class TaskWaiterMixin {
+    static {
+    }
+
+    @Inject(method={"createBrainTasks(Lcom/github/tartaricacid/touhoulittlemaid/entity/passive/EntityMaid;)Ljava/util/List;"}, at={@At(value="RETURN")}, cancellable=true, remap=false)
+    private void addDeliverOrderTask(EntityMaid maid, CallbackInfoReturnable<List<Pair<Integer, BehaviorControl<? super EntityMaid>>>> cir) {
+        // 已禁用 MaidDeliverOrderTask，统一使用 DeliveryBridge 作为唯一的配送系统
+        // 避免两套配送系统同时运行导致女仆状态混乱和卡住
+        // 不修改返回值，保持女仆餐厅原有的大脑任务
+    }
+}

@@ -1,0 +1,413 @@
+package com.icewolf.maidrestaurant.automation.core;
+
+import cn.breezeth.ordertocook.block.entity.OrderMachineBlockEntity;
+import cn.breezeth.ordertocook.block.entity.TakeoutBagBlockEntity;
+import cn.breezeth.ordertocook.block.entity.TakeoutBoxBlockEntity;
+import cn.breezeth.ordertocook.core.ModConstants;
+import cn.breezeth.ordertocook.item.TakeoutBagItem;
+import com.github.tartaricacid.touhoulittlemaid.entity.passive.EntityMaid;
+import com.icewolf.maidrestaurant.automation.MaidRestaurantAutomation;
+import com.icewolf.maidrestaurant.automation.core.BusinessManager;
+import com.icewolf.maidrestaurant.automation.core.MaidUtils;
+import com.icewolf.maidrestaurant.automation.core.OrderBridge;
+import com.icewolf.maidrestaurant.automation.core.PackagingCompat;
+import com.icewolf.maidrestaurant.automation.core.ProgressionManager;
+import java.lang.ref.WeakReference;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import net.minecraft.core.BlockPos;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraftforge.items.IItemHandler;
+
+public class PackagingBridge {
+    private static final int STATE_GO_TO_COUNTER = 0;
+    private static final int STATE_PACK = 1;
+    private static final Map<BlockPos, PackTask> packTasks = new HashMap<BlockPos, PackTask>();
+
+    /** 服务器启动时清空装盘流程任务（见 {@link RuntimeState}）。 */
+    public static void clearRuntimeState() {
+        packTasks.clear();
+    }
+
+    public static void tickPackaging(ServerLevel level, BusinessManager manager) {
+        PackagingBridge.tickPackTasks(level, manager);
+        int counterCount = manager.getCounterToMachine().size();
+        // 每次都输出调试日志，方便排查问题
+        
+        // 冷启动兜底：counterToMachine 为空时，以每台打单机为中心局部扫描操作台建立绑定。
+        // 方案A：不再全局扫描操作台，复用 OrderBridge 的 OTC 式局部圆扫（半径24、垂直±8、缓存1秒）。
+        if (counterCount == 0) {
+            List<BlockPos> machines = null;
+            try {
+                machines = WorldScanner.scan(level, OrderMachineBlockEntity.class);
+            } catch (Throwable t) {
+                MaidRestaurantAutomation.LOGGER.error("打包: 扫描打单机失败", t);
+            }
+            if (machines != null) {
+                for (BlockPos machinePos : machines) {
+                    List<BlockPos> localCounters;
+                    try {
+                        localCounters = OrderBridge.scanCountersAround(level, machinePos);
+                    } catch (Throwable t) {
+                        MaidRestaurantAutomation.LOGGER.error("打包: 局部扫描操作台失败", t);
+                        continue;
+                    }
+                    for (BlockPos counterPos : localCounters) {
+                        // 临时添加到counterToMachine（下一周期 OrderBridge 会按最近机器重建）
+                        manager.getCounterToMachine().putIfAbsent(counterPos, machinePos);
+                    }
+                }
+            }
+        }
+        
+        for (Map.Entry<BlockPos, BlockPos> entry : manager.getCounterToMachine().entrySet()) {
+            BlockPos counterPos = entry.getKey();
+            BlockPos machinePos = entry.getValue();
+            boolean deliveryUnlocked = ProgressionManager.isDeliveryUnlocked(level, machinePos);
+            boolean activated = OrderBridge.isActivated(level, machinePos);
+            if (!deliveryUnlocked || !activated) continue;
+            try {
+                PackagingBridge.checkAndStart(level, counterPos, manager);
+            }
+            catch (Throwable t) {
+                MaidRestaurantAutomation.LOGGER.error("Error checking pack at {}", counterPos, t);
+            }
+        }
+    }
+
+    private static void tickPackTasks(ServerLevel level, BusinessManager manager) {
+        Iterator<Map.Entry<BlockPos, PackTask>> it = packTasks.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<BlockPos, PackTask> entry = it.next();
+            BlockPos counterPos = entry.getKey();
+            PackTask task = entry.getValue();
+            EntityMaid maid = (EntityMaid)task.maidRef.get();
+            if (maid == null || !(level.getBlockEntity(counterPos) instanceof TakeoutBoxBlockEntity)) {
+                // TaskManager：任务失败
+                if (maid != null) {
+                    TaskManager.getInstance().failTask(maid.getUUID(), "packaging target missing");
+                }
+                task.cleanup();
+                it.remove();
+                continue;
+            }
+            // TaskManager心跳更新
+            TaskManager.getInstance().heartbeat(maid.getUUID(), manager.getTickCounter());
+            long now = level.getGameTime();
+            switch (task.state) {
+                case 0: {
+                    // 仅当女仆真正走到操作台附近才开始打包；不再有"3s 后强制打包"兜底，
+                    // 避免女仆还没走到就被强制打包。若长时间走不到，由 TaskManager
+                    // 打包任务超时（默认600tick=30s）判定失败、重新分配，不会卡死。
+                    boolean near = MaidUtils.isNear(maid, counterPos, 3.0);
+                    if (near) {
+                        task.state = 1;
+                        break;
+                    }
+                    if (now - task.lastChange > 20L) {
+                        task.lastChange = now;
+                    }
+                    MaidUtils.moveToSide(maid, counterPos, 0.4);
+                    break;
+                }
+                case 1: {
+                    // TaskManager：标记开始交互
+                    TaskManager.getInstance().startInteraction(maid.getUUID());
+                    boolean packSuccess = PackagingBridge.executePack(level, counterPos, manager);
+                    if (packSuccess) {
+                        // TaskManager：完成任务
+                        TaskManager.getInstance().completeTask(maid.getUUID());
+                    } else {
+                        // 打包失败（可能玩家提前拿走了餐盘或订单不满足），标记任务失败
+                        MaidRestaurantAutomation.LOGGER.warn("打包: 女仆 {} 在操作台 {} 打包失败，可能玩家提前操作或订单不满足", maid.getName().getString(), counterPos);
+                        TaskManager.getInstance().failTask(maid.getUUID(), "packaging execute failed");
+                    }
+                    task.cleanup();
+                    it.remove();
+                }
+            }
+        }
+    }
+
+    private static void checkAndStart(ServerLevel level, BlockPos counterPos, BusinessManager manager) {
+        if (packTasks.containsKey(counterPos)) {
+            return;
+        }
+        // 排班表配置检查：如果附近有排班表且关闭了自动打包，则不执行
+        BlockPos machinePos = manager.getCounterToMachine().get(counterPos);
+        if (machinePos != null && !MaidUtils.isScheduleBoardEnabled(level, machinePos, MaidUtils.SCHED_AUTO_PACKAGING)) {
+            return;
+        }
+        BlockEntity be = level.getBlockEntity(counterPos);
+        if (!(be instanceof TakeoutBoxBlockEntity)) {
+            return;
+        }
+        IItemHandler inv = OrderBridge.getItemHandler(be);
+        if (inv == null) {
+            return;
+        }
+        ItemStack orderStack = inv.getStackInSlot(0);
+        if (orderStack.isEmpty() || !orderStack.is((Item)OtcCompat.ORDER())) {
+            return;
+        }
+        CompoundTag nbt = orderStack.getTag();
+        if (nbt == null) {
+            return;
+        }
+        boolean isDelivery = nbt.getBoolean("Delivery");
+        // 使用兼容层执行打包/装盘（同时支持 Forge 和 Fabric 版本）
+        boolean success = PackagingCompat.execute(level, counterPos, isDelivery, null, true);
+        if (!success) {
+            return;
+        }
+        if (!level.getBlockState(counterPos.above()).isAir()) {
+            return;
+        }
+        // 打单机员工人数限制检查
+        if (machinePos == null) {
+            machinePos = manager.getCounterToMachine().get(counterPos);
+        }
+        if (machinePos != null && !MaidUtils.canAcceptWorker(level, machinePos)) {
+            return;
+        }
+        // 智能查找女仆：有绑定女仆时只找绑定的，否则回退到自动分配
+        EntityMaid maid = MaidUtils.findWaiterMaidSmart(level, counterPos, 24, machinePos);
+        if (maid == null) {
+            return;
+        }
+        // 任务冲突检查：如果女仆已有任务在执行，不分配打包任务
+        if (TaskManager.getInstance().hasMaidTask(maid.getUUID())) {
+            return;
+        }
+        if (MaidUtils.isOccupied(maid)) {
+            return;
+        }
+
+        // TaskManager集成：创建打包任务并分配给女仆
+        String taskId = TaskManager.getInstance().createTask(TaskManager.TYPE_PACKAGING, counterPos, machinePos);
+        if (taskId != null) {
+            packTasks.put(counterPos, new PackTask(maid, machinePos, manager.getTickCounter()));
+            TaskManager.getInstance().assignTask(maid.getUUID(), TaskManager.TYPE_PACKAGING, level);
+        }
+    }
+
+    private static boolean executePack(ServerLevel level, BlockPos counterPos, BusinessManager manager) {
+        BlockEntity be = level.getBlockEntity(counterPos);
+        if (!(be instanceof TakeoutBoxBlockEntity)) {
+            MaidRestaurantAutomation.LOGGER.warn("打包: 操作台 {} 不是 TakeoutBoxBlockEntity", counterPos);
+            return false;
+        }
+        IItemHandler inv = OrderBridge.getItemHandler(be);
+        if (inv == null) {
+            MaidRestaurantAutomation.LOGGER.warn("打包: 操作台 {} 无法获取物品处理器", counterPos);
+            return false;
+        }
+        ItemStack orderStack = inv.getStackInSlot(0);
+        if (orderStack.isEmpty() || !orderStack.is((Item)OtcCompat.ORDER())) {
+            MaidRestaurantAutomation.LOGGER.warn("打包: 操作台 {} 没有有效订单（可能玩家已提前处理）", counterPos);
+            return false;
+        }
+        CompoundTag nbt = orderStack.getTag();
+        if (nbt == null) {
+            MaidRestaurantAutomation.LOGGER.warn("打包: 操作台 {} 订单没有NBT数据", counterPos);
+            return false;
+        }
+        // 打包前捕获玩家包裹信息（此时订单仍在槽0；外卖袋在部分 OTC 版本下不会自动带上这些自定义 NBT，
+        // 需在打包后显式补回，确保女仆配送能识别）。与 TakeoutBoxBlockEntityMixin 互为兜底。
+        CompoundTag playerPkg = capturePlayerPackage(nbt);
+        // 确保订单NBT中有machineId，用于餐厅统计（解决"不知名餐厅"问题）
+        ensureMachineIdInOrder(level, counterPos, nbt, manager);
+        boolean isDelivery = nbt.getBoolean("Delivery");
+        if (!level.getBlockState(counterPos.above()).isAir()) {
+            MaidRestaurantAutomation.LOGGER.warn("打包: 操作台 {} 上方不是空气（可能已有餐盘或被玩家放置方块）", counterPos);
+            return false;
+        }
+        // 使用兼容层执行打包/装盘（同时支持 Forge 和 Fabric 版本）
+        boolean actual = PackagingCompat.execute(level, counterPos, isDelivery, null, false);
+        if (!actual) {
+            MaidRestaurantAutomation.LOGGER.warn("打包: 操作台 {} 实际打包执行失败（可能食材不足或玩家提前操作）", counterPos);
+            return false;
+        }
+        // 玩家包裹兜底补标：部分 OTC 版本（Fabric 版经信雅互联强制在 Forge 运行）打包时不会把订单上的自定义 NBT
+        // 过到外卖袋，导致 TakeoutBoxBlockEntityMixin 未能写入 PLAYER_PACKAGE 等字段，女仆无法识别配送。
+        // 这里在打包完成后显式把玩家包裹信息补写进外卖袋（对已被 Mixin 标过的袋子幂等跳过）。
+        stampPlayerBagIfNeeded(level, counterPos, playerPkg);
+        return true;
+    }
+
+    /** 打包前从订单 NBT 捕获玩家包裹信息（仅玩家订单非空）。 */
+    private static CompoundTag capturePlayerPackage(CompoundTag orderNbt) {
+        if (orderNbt == null || !orderNbt.getBoolean(PlayerOrderManager.PLAYER_ORDER)) {
+            return null;
+        }
+        CompoundTag pkg = new CompoundTag();
+        if (orderNbt.contains(ModConstants.NBT_FOOD_LIST)) {
+            pkg.put(ModConstants.NBT_FOOD_LIST, orderNbt.getCompound(ModConstants.NBT_FOOD_LIST).copy());
+        }
+        pkg.putBoolean(PlayerOrderManager.PLAYER_ORDER, true);
+        pkg.putBoolean(PlayerOrderManager.PLAYER_PACKAGE, true);
+        if (orderNbt.hasUUID(PlayerOrderManager.BUYER_UUID)) {
+            pkg.putUUID(PlayerOrderManager.BUYER_UUID, orderNbt.getUUID(PlayerOrderManager.BUYER_UUID));
+        }
+        if (orderNbt.contains(PlayerOrderManager.BUYER_NAME)) {
+            pkg.putString(PlayerOrderManager.BUYER_NAME, orderNbt.getString(PlayerOrderManager.BUYER_NAME));
+        }
+        if (orderNbt.contains(PlayerOrderManager.PLAYER_DELIVERY_POS)) {
+            pkg.put(PlayerOrderManager.PLAYER_DELIVERY_POS, orderNbt.getCompound(PlayerOrderManager.PLAYER_DELIVERY_POS).copy());
+        }
+        if (orderNbt.contains(ModConstants.NBT_ORDER_ID)) {
+            pkg.putString(ModConstants.NBT_ORDER_ID, orderNbt.getString(ModConstants.NBT_ORDER_ID));
+        }
+        if (orderNbt.contains(ModConstants.NBT_EXPIRY_TICK)) {
+            pkg.putLong(ModConstants.NBT_EXPIRY_TICK, orderNbt.getLong(ModConstants.NBT_EXPIRY_TICK));
+        }
+        if (orderNbt.contains(ModConstants.NBT_PRESTIGE)) {
+            pkg.putInt(ModConstants.NBT_PRESTIGE, orderNbt.getInt(ModConstants.NBT_PRESTIGE));
+        }
+        if (orderNbt.contains(ModConstants.NBT_MACHINE_POS)) {
+            pkg.putLong(ModConstants.NBT_MACHINE_POS, orderNbt.getLong(ModConstants.NBT_MACHINE_POS));
+        }
+        if (orderNbt.contains(ModConstants.NBT_MACHINE_DIM)) {
+            pkg.putString(ModConstants.NBT_MACHINE_DIM, orderNbt.getString(ModConstants.NBT_MACHINE_DIM));
+        }
+        return pkg;
+    }
+
+    /** 打包完成后，把玩家包裹信息补写进生成的外卖袋（若 Mixin 已标过则跳过）。 */
+    private static void stampPlayerBagIfNeeded(ServerLevel level, BlockPos counterPos, CompoundTag playerPkg) {
+        if (playerPkg == null) return;
+        BlockEntity aboveBe = level.getBlockEntity(counterPos.above());
+        if (!(aboveBe instanceof TakeoutBagBlockEntity bagBe)) return;
+        ItemStack bag = bagBe.getBagStack();
+        if (bag.isEmpty() || !(bag.getItem() instanceof TakeoutBagItem)) return;
+        CompoundTag bagNbt = bag.getTag();
+        if (bagNbt != null && bagNbt.getBoolean(PlayerOrderManager.PLAYER_PACKAGE)) {
+            return; // 已被 Mixin 标过，避免重复写入
+        }
+        CompoundTag merged = bagNbt != null ? bagNbt.copy() : new CompoundTag();
+        for (String key : playerPkg.getAllKeys()) {
+            merged.put(key, playerPkg.get(key));
+        }
+        bag.setTag(merged);
+        bagBe.setBagStack(bag);
+        // 通知托管：订单已进入已打包状态（与 Mixin 行为对齐）
+        try {
+            String oid = playerPkg.getString(ModConstants.NBT_ORDER_ID);
+            if (!oid.isEmpty()) {
+                PlayerOrderEscrow.get(level.getServer()).markPacked(oid);
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    /**
+     * 确保订单NBT中有order_machine.id字段
+     * 从对应的订单机获取machineId并写入订单NBT
+     */
+    private static void ensureMachineIdInOrder(ServerLevel level, BlockPos counterPos, CompoundTag nbt, BusinessManager manager) {
+        try {
+            // 如果已经有machineId，就不用再设置了
+            if (nbt.contains("order_machine.id") && nbt.getInt("order_machine.id") > 0) {
+                return;
+            }
+            // 从manager获取对应的订单机位置
+            BlockPos machinePos = manager.getCounterToMachine().get(counterPos);
+            if (machinePos == null) {
+                MaidRestaurantAutomation.LOGGER.warn("打包: 操作台 {} 没有对应的订单机，无法设置machineId", counterPos);
+                return;
+            }
+            BlockEntity machineBe = level.getBlockEntity(machinePos);
+            if (machineBe == null) {
+                return;
+            }
+            // 通过反射调用getMachineId()或ensureMachineId()
+            int machineId = getMachineIdFromOrderMachine(machineBe, level);
+            if (machineId > 0) {
+                nbt.putInt("order_machine.id", machineId);
+            }
+        } catch (Throwable t) {
+            MaidRestaurantAutomation.LOGGER.error("设置订单machineId失败", t);
+        }
+    }
+
+    /**
+     * 通过反射从订单机获取machineId
+     */
+    private static int getMachineIdFromOrderMachine(BlockEntity machineBe, ServerLevel level) {
+        try {
+            // 先尝试getMachineId()
+            try {
+                java.lang.reflect.Method getMachineId = machineBe.getClass().getMethod("getMachineId");
+                Object result = getMachineId.invoke(machineBe);
+                if (result instanceof Integer && (Integer)result > 0) {
+                    return (Integer)result;
+                }
+            } catch (NoSuchMethodException ignored) {}
+
+            // 再尝试ensureMachineId()（需要ServerWorld参数，Fabric版本）
+            try {
+                java.lang.reflect.Method ensureMachineId = machineBe.getClass().getMethod("ensureMachineId", level.getClass());
+                Object result = ensureMachineId.invoke(machineBe, level);
+                if (result instanceof Integer && (Integer)result > 0) {
+                    return (Integer)result;
+                }
+            } catch (NoSuchMethodException ignored) {}
+
+            // 尝试直接读取machineId字段
+            try {
+                java.lang.reflect.Field field = machineBe.getClass().getDeclaredField("machineId");
+                field.setAccessible(true);
+                Object result = field.get(machineBe);
+                if (result instanceof Integer && (Integer)result > 0) {
+                    return (Integer)result;
+                }
+            } catch (NoSuchFieldException ignored) {}
+        } catch (Throwable t) {
+            MaidRestaurantAutomation.LOGGER.error("从订单机获取machineId失败", t);
+        }
+        return 0;
+    }
+
+    private static class PackTask {
+        int state = 0;
+        long lastChange = 0L;
+        final WeakReference<EntityMaid> maidRef;
+
+        PackTask(EntityMaid maid, BlockPos machinePos, long currentTick) {
+            this.maidRef = new WeakReference<EntityMaid>(maid);
+            MaidUtils.setOccupied(maid, true);
+            MaidUtils.startTask(maid, machinePos, "packaging", currentTick);
+            // 显示侍者开始打包气泡
+            try {
+                com.icewolf.maidrestaurant.automation.util.MaidChatBubbleHelper.waiterPacking(maid);
+            } catch (Exception e) {}
+        }
+
+        void cleanup() {
+            EntityMaid maid = (EntityMaid)this.maidRef.get();
+            if (maid != null) {
+                try {
+                    // 调用TaskSafetyUtils彻底重置女仆状态
+                    TaskSafetyUtils.resetMaidState(maid);
+                } catch (Throwable t) {
+                    MaidRestaurantAutomation.LOGGER.warn("打包任务清理时TaskSafetyUtils.resetMaidState失败", t);
+                    // 回退：手动清理
+                    try {
+                        maid.getNavigation().stop();
+                        maid.getBrain().eraseMemory(net.minecraft.world.entity.ai.memory.MemoryModuleType.WALK_TARGET);
+                        maid.getBrain().eraseMemory(net.minecraft.world.entity.ai.memory.MemoryModuleType.PATH);
+                    } catch (Throwable t2) {}
+                    MaidUtils.setOccupied(maid, false);
+                }
+            }
+        }
+    }
+}

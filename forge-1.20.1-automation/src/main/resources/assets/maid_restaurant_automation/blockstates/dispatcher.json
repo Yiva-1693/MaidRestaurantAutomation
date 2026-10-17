@@ -1,0 +1,5 @@
+{
+  "variants": {
+    "": { "model": "maid_restaurant_automation:block/dispatcher" }
+  }
+}

@@ -1,0 +1,64 @@
+modLoader="javafml"
+loaderVersion="[47,)"
+license="MIT"
+
+[[mods]]
+modId="maid_restaurant_automation"
+version="${mod_version}"
+displayName="[女仆餐厅：自动化附属] Maid Restaurant: Automation Addon (1.20.1 Forge)"
+authors="IceWolf"
+logoFile="maid_restaurant_automation.png"
+description='''
+Maid Restaurant: Automation Addon
+
+Touhou Little Maid x Maid Restaurant x Order to Cook integration addon.
+
+Dispatcher-driven dine-in restaurant automation:
+- Dispatcher block as the single control/observation center
+- Explicit order state machine for dine-in orders (Order_Type == 1 only)
+- Workstation binding: every maid claims her own cookware/bench, green particles on claim
+- Profession + cookware type matching, atomic reservations
+- Ready-made stock priority (skip cooking when the dish already exists)
+- Waiter replaces expired orders on the countertop instead of waiting
+- Staff overview and countertop order queue GUI
+
+No takeout, no delivery station. Requires Order To Cook 1.3.6+.
+'''
+
+[[mixins]]
+config="maid_restaurant_automation.mixins.json"
+
+[[dependencies.maid_restaurant_automation]]
+    modId="forge"
+    mandatory=true
+    versionRange="[47,)"
+    ordering="NONE"
+    side="BOTH"
+
+[[dependencies.maid_restaurant_automation]]
+    modId="minecraft"
+    mandatory=true
+    versionRange="[1.20.1]"
+    ordering="NONE"
+    side="BOTH"
+
+[[dependencies.maid_restaurant_automation]]
+    modId="touhou_little_maid"
+    mandatory=true
+    versionRange="[1.5.3,)"
+    ordering="AFTER"
+    side="BOTH"
+
+[[dependencies.maid_restaurant_automation]]
+    modId="maid_restaurant"
+    mandatory=true
+    versionRange="[0.2.9,)"
+    ordering="AFTER"
+    side="BOTH"
+
+[[dependencies.maid_restaurant_automation]]
+    modId="ordertocook"
+    mandatory=true
+    versionRange="[1.3.6,)"
+    ordering="AFTER"
+    side="BOTH"

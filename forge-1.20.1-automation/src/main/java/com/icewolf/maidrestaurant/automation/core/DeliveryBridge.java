@@ -1,0 +1,1102 @@
+package com.icewolf.maidrestaurant.automation.core;
+
+import cn.breezeth.ordertocook.block.entity.FoodPlateBlockEntity;
+import cn.breezeth.ordertocook.block.entity.TakeoutBoxBlockEntity;
+import cn.breezeth.ordertocook.entity.CustomerEntity;
+import cn.breezeth.ordertocook.item.TakeoutBagItem;
+import cn.breezeth.ordertocook.registry.ModItems;
+import com.github.tartaricacid.touhoulittlemaid.api.task.IMaidTask;
+import com.github.tartaricacid.touhoulittlemaid.entity.passive.EntityMaid;
+import com.icewolf.maidrestaurant.automation.MaidRestaurantAutomation;
+import com.icewolf.maidrestaurant.automation.util.MaidChatBubbleHelper;
+import com.icewolf.maidrestaurant.automation.config.AutomationConfig;
+import com.icewolf.maidrestaurant.automation.config.GameplayConfig;
+import com.icewolf.maidrestaurant.automation.core.CustomerCompat;
+import com.mastermarisa.maid_restaurant.maid.task.TaskWaiter;
+import com.mastermarisa.maid_restaurant.utils.BehaviorUtils;
+import com.mojang.authlib.GameProfile;
+import java.lang.reflect.Method;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Vec3i;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.InteractionResult;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.ai.behavior.BlockPosTracker;
+import net.minecraft.world.entity.ai.behavior.PositionTracker;
+import net.minecraft.world.entity.ai.memory.MemoryModuleType;
+import net.minecraft.world.entity.ai.memory.WalkTarget;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.phys.AABB;
+import net.minecraftforge.common.util.FakePlayer;
+import net.minecraftforge.common.util.FakePlayerFactory;
+import net.minecraftforge.items.IItemHandler;
+import net.minecraftforge.items.ItemHandlerHelper;
+import net.minecraftforge.items.wrapper.CombinedInvWrapper;
+import net.minecraftforge.registries.ForgeRegistries;
+
+public class DeliveryBridge {
+    private static final String TAG_COUNTER_POS = "BusinessDeliverCounter";
+    private static final String TAG_CUSTOMER_ID = "BusinessDeliverCustomerId";
+    private static final String TAG_STAGE = "BusinessDeliverStage";
+    private static final String TAG_PLATE_PICKUP_RETRY = "BusinessDeliverPlateRetry";
+    private static final String TAG_PLAYER_POS = "BusinessDeliverPlayerPos";
+    private static final int STAGE_GO_TO_COUNTER = 0;
+    private static final int STAGE_GO_TO_CUSTOMER = 1;
+    private static final int STAGE_GO_TO_PLAYER_POS = 3;
+    private static final float MOVEMENT_SPEED = 0.4f;
+    private static final double CLOSE_ENOUGH_DIST = 2.0;
+    // 玩家外卖袋放下距离：比交接点更宽松（站到送餐点方块顶面上会先吃掉 1 格垂直距离）
+    private static final double PLAYER_DELIVERY_PLACE_DIST = 3.0;
+    private static final int MAX_PLATE_PICKUP_RETRY = 3;
+
+    public static void tickDelivery(ServerLevel level, BusinessManager manager) {
+        if (!AutomationConfig.waiterDeliver) {
+            return;
+        }
+        try {
+            tickMaidDelivery(level, manager);
+        } catch (Throwable t) {
+            MaidRestaurantAutomation.LOGGER.error("Delivery tick error", t);
+        }
+    }
+
+    private static int debugTickCounter = 0;
+
+    private static void tickMaidDelivery(ServerLevel level, BusinessManager manager) {
+        debugTickCounter++;
+        // 使用TaskManager的中心化检索缓存，避免重复获取所有女仆
+        List<EntityMaid> allMaids = TaskManager.getInstance().getCachedMaids(level);
+        
+        // 每100tick打印一次调试信息
+        if (debugTickCounter % 100 == 0) {
+            int waiterCount = 0;
+            for (EntityMaid maid : allMaids) {
+                if (isWaiterMaid(maid)) waiterCount++;
+            }
+        }
+
+        // 1. 处理正在送餐的女仆
+        for (EntityMaid maid : allMaids) {
+            if (!isWaiterMaid(maid)) continue;
+            CompoundTag data = maid.getPersistentData();
+            if (!data.contains(TAG_COUNTER_POS)) continue;
+            // 确保正在送餐的女仆被标记为忙碌（防止标记丢失导致任务冲突）
+            if (!MaidUtils.isOccupied(maid)) {
+                MaidUtils.setOccupied(maid, true);
+            }
+            processDeliveringMaid(level, maid, manager);
+        }
+
+        // 2. 统一分配：收集空闲侍者，由 TaskManager 缓存统一扫待配送操作台，逐个定向分配
+        //    （不再让每个女仆各自扫餐盘，避免多个侍者抢同一个餐盘）
+        java.util.List<EntityMaid> idleWaiters = new java.util.ArrayList<EntityMaid>();
+        for (EntityMaid maid : allMaids) {
+            if (!isWaiterMaid(maid)) continue;
+            CompoundTag data = maid.getPersistentData();
+            if (data.contains(TAG_COUNTER_POS)) continue;
+            // TaskManager智能任务分配：检查女仆是否有任务在执行，避免任务冲突
+            if (TaskManager.getInstance().hasMaidTask(maid.getUUID())) continue;
+            if (MaidUtils.isOccupied(maid)) {
+                // 幽灵忙碌检测：被标记忙碌但没有实际任务标记，清理后视为空闲
+                boolean hasTask = data.contains(TAG_COUNTER_POS) ||
+                                  data.contains("BusinessPackCounter") ||
+                                  data.contains("BusinessWashCounter") ||
+                                  data.contains("BusinessCookCounter");
+                if (!hasTask && !MaidUtils.hasTaskTracker(maid.getUUID())) {
+                    if (com.icewolf.maidrestaurant.automation.util.LogThrottle.allow(
+                            "deliver_ghost_busy:" + maid.getUUID(), level.getGameTime())) {
+                        MaidRestaurantAutomation.LOGGER.warn("送餐: 女仆 {} 被标记为忙碌但没有实际任务，立即清理忙碌标记", maid.getName().getString());
+                    }
+                    MaidUtils.setOccupied(maid, false);
+                    idleWaiters.add(maid);
+                }
+                continue;
+            }
+            idleWaiters.add(maid);
+        }
+        assignDeliveryTasks(level, manager, idleWaiters);
+    }
+
+    private static boolean isWaiterMaid(EntityMaid maid) {
+        try {
+            IMaidTask task = maid.getTask();
+            if (task == null) return false;
+            boolean isWaiter = task instanceof TaskWaiter;
+            return isWaiter;
+        } catch (Throwable t) {
+            MaidRestaurantAutomation.LOGGER.error("isWaiterMaid error for maid {}: {}", maid.getName().getString(), t.toString());
+            return false;
+        }
+    }
+
+    /**
+     * 统一分配送餐任务：由 TaskManager 缓存统一收集待配送操作台，逐个定向分配给最近的空闲侍者。
+     * 每个操作台只可能被建一个任务、钉给一个女仆，避免多个侍者抢同一个餐盘。
+     */
+    private static void assignDeliveryTasks(ServerLevel level, BusinessManager manager, List<EntityMaid> idleWaiters) {
+        if (idleWaiters.isEmpty()) return;
+
+        // 外卖袋（速递站方向）优先，其次堂食餐盘
+        List<BlockPos> bagCounters = TaskManager.getInstance().getCachedCountersWithTakeoutBags(level);
+        List<BlockPos> plateCounters0 = TaskManager.getInstance().getCachedCountersWithPlates(level);
+        if (bagCounters != null) {
+            for (BlockPos counterPos : bagCounters) {
+                if (idleWaiters.isEmpty()) break;
+                if (TaskManager.getInstance().hasTaskAt(counterPos, TaskManager.TYPE_DELIVERY)) continue;
+                EntityMaid maid = pickDeliveryWaiter(level, counterPos, manager, idleWaiters, true);
+                if (maid == null) continue;
+                boolean started = startDeliveryTo(level, maid, counterPos, manager, true);
+                if (started) {
+                    idleWaiters.remove(maid);
+                }
+            }
+        }
+        List<BlockPos> plateCounters = TaskManager.getInstance().getCachedCountersWithPlates(level);
+        if (plateCounters != null) {
+            for (BlockPos counterPos : plateCounters) {
+                if (idleWaiters.isEmpty()) break;
+                if (TaskManager.getInstance().hasTaskAt(counterPos, TaskManager.TYPE_DELIVERY)) continue;
+                EntityMaid maid = pickDeliveryWaiter(level, counterPos, manager, idleWaiters, false);
+                if (maid == null) continue;
+                if (startDeliveryTo(level, maid, counterPos, manager, false)) {
+                    idleWaiters.remove(maid);
+                }
+            }
+        }
+    }
+
+    /**
+     * 为某操作台挑选配送侍者，与打包/洗碗同口径（MaidUtils.findWaiterMaidSmart）：
+     * 打单机有绑定员工时只在绑定侍者中挑，无绑定则自动分配最近空闲侍者。
+     * 候选再限定为本轮空闲列表，做范围/忙碌/绑定双重过滤，避免把绑定门店的柜台派给
+     * 非绑定侍者，或把同一侍者派给多个柜台。无合适侍者时返回 null，由调用方跳过该柜台。
+     */
+    private static EntityMaid pickDeliveryWaiter(ServerLevel level, BlockPos counterPos, BusinessManager manager, List<EntityMaid> idleWaiters, boolean isPackage) {
+        if (idleWaiters.isEmpty()) return null;
+        BlockPos machinePos = manager.getCounterToMachine().get(counterPos);
+        BlockPos endPos = resolveDeliveryEnd(level, counterPos, isPackage);
+        // 遍历本轮空闲侍者：操作台永远校验、终点解析到才校验，避免"先选一个再判"漏掉可覆盖终点的人
+        return MaidUtils.pickSmartWaiterAmong(level, idleWaiters, counterPos, endPos, 24, machinePos);
+    }
+
+    /**
+     * 解析操作台上方包裹的配送终点。
+     * 玩家包裹→送餐点；堂食餐盘→按 OrderId 找顾客。
+     * 返回 null 表示终点解析不到（业务失败），此时仅校验操作台、由执行阶段气泡处理。
+     */
+    private static BlockPos resolveDeliveryEnd(ServerLevel level, BlockPos counterPos, boolean isPackage) {
+        BlockEntity aboveBe = level.getBlockEntity(counterPos.above());
+        if (aboveBe == null) return null;
+        ItemStack aboveStack = getTakeoutBagStack(aboveBe);
+        CompoundTag aboveTag = aboveStack.getTag();
+        if (aboveTag == null) return null;
+
+        // 玩家包裹：读送餐点
+        if (aboveTag.getBoolean(PlayerOrderManager.PLAYER_PACKAGE)) {
+            CompoundTag dp = aboveTag.getCompound(PlayerOrderManager.PLAYER_DELIVERY_POS);
+            if (dp.contains("x")) {
+                return new BlockPos(dp.getInt("x"), dp.getInt("y"), dp.getInt("z"));
+            }
+            return null;
+        }
+        // 堂食餐盘：读 OrderId 找顾客
+        String orderId = aboveTag.contains("OrderId") ? aboveTag.getString("OrderId") : "";
+        if (orderId.isEmpty()) return null;
+        LivingEntity customer = findCustomerByOrderId(level, counterPos, orderId);
+        return customer != null ? customer.blockPosition() : null;
+    }
+
+    /**
+     * 把指定操作台的配送任务定向发起给 maid。
+     * 校验不通过或任务认领失败时不发寻路、并回滚忙碌标记，返回 false。
+     */
+    private static boolean startDeliveryTo(ServerLevel level, EntityMaid maid, BlockPos counterPos, BusinessManager manager, boolean isPackage) {
+        // 直接复用操作台归属的打单机（counterToMachine 按水平24/垂直±8建立，与打包同源），
+        // 不再用三维8格独立扫描，避免操作台落在8~24格时打包正常、配送却被误拦。
+        // 无归属或归属机器未激活时本轮不派，下周期(20tick≈1s)归属重建后自动重试。
+        BlockPos machinePos = manager.getCounterToMachine().get(counterPos);
+        if (machinePos == null || !OrderBridge.isActivated(level, machinePos)) {
+            return false;
+        }
+        if (!ProgressionManager.isDeliveryUnlocked(level, machinePos)) {
+            return false;
+        }
+        if (!MaidUtils.isScheduleBoardEnabled(level, machinePos, MaidUtils.SCHED_AUTO_DELIVERY)) {
+            return false;
+        }
+
+        int boundCount = MaidUtils.getWorkerCountForMachine(machinePos);
+        if (boundCount > 0 && !MaidUtils.isMaidBoundToMachine(maid.getUUID(), machinePos)) {
+            return false;
+        }
+
+        if (!MaidUtils.canAcceptWorker(level, machinePos)) {
+            return false;
+        }
+
+        CompoundTag data = maid.getPersistentData();
+        data.putLong(TAG_COUNTER_POS, counterPos.asLong());
+        data.remove(TAG_CUSTOMER_ID);
+        data.putInt(TAG_STAGE, STAGE_GO_TO_COUNTER);
+        MaidUtils.setOccupied(maid, true);
+        MaidUtils.startTask(maid, machinePos, "delivery", manager.getTickCounter());
+        try {
+            MaidChatBubbleHelper.waiterStartDelivery(maid);
+        } catch (Exception e) {
+            MaidRestaurantAutomation.LOGGER.error("waiterStartDelivery 调用失败 maid={} error={}", maid.getName().getString(), e.toString(), e);
+        }
+
+        String taskId = TaskManager.getInstance().createTask(TaskManager.TYPE_DELIVERY, counterPos, machinePos);
+        if (taskId == null) {
+            data.remove(TAG_COUNTER_POS);
+            data.remove(TAG_STAGE);
+            MaidUtils.setOccupied(maid, false);
+            return false;
+        }
+        if (!TaskManager.getInstance().assignSpecificTask(maid.getUUID(), taskId)) {
+            TaskManager.getInstance().discardTask(taskId);
+            data.remove(TAG_COUNTER_POS);
+            data.remove(TAG_STAGE);
+            MaidUtils.setOccupied(maid, false);
+            return false;
+        }
+
+        maid.getBrain().setMemory(MemoryModuleType.WALK_TARGET,
+            new WalkTarget(counterPos, (float) MOVEMENT_SPEED, 1));
+        return true;
+    }
+
+    private static void processDeliveringMaid(ServerLevel level, EntityMaid maid, BusinessManager manager) {
+        CompoundTag data = maid.getPersistentData();
+        int stage = data.getInt(TAG_STAGE);
+        BlockPos counterPos = BlockPos.of(data.getLong(TAG_COUNTER_POS));
+
+        // TaskManager心跳更新
+        TaskManager.getInstance().heartbeat(maid.getUUID(), manager.getTickCounter());
+
+        // 详细调试日志：每20tick输出一次女仆状态
+        if (maid.tickCount % 20 == 0) {
+        }
+
+        // 目标消失检测：操作台是否还存在
+        if (!(level.getBlockEntity(counterPos) instanceof TakeoutBoxBlockEntity)) {
+            MaidRestaurantAutomation.LOGGER.warn("送餐: 女仆 {} 的操作台 {} 已消失，立即结束任务", maid.getName().getString(), counterPos);
+            finishDelivery(maid, false);
+            return;
+        }
+
+        if (stage == STAGE_GO_TO_COUNTER) {
+            double dist = maid.distanceToSqr(counterPos.getX() + 0.5, counterPos.getY(), counterPos.getZ() + 0.5);
+            if (dist <= CLOSE_ENOUGH_DIST * CLOSE_ENOUGH_DIST) {
+                // 先尝试拿取餐盘（堂食）
+                ItemStack plate = pickUpPlate(level, counterPos, maid);
+                if (!plate.isEmpty()) {
+                    // 拿到餐盘，重置重试计数器
+                    data.remove(TAG_PLATE_PICKUP_RETRY);
+                    String orderId = "";
+                    CompoundTag plateTag = plate.getTag();
+                    if (plateTag != null && plateTag.contains("OrderId")) {
+                        orderId = plateTag.getString("OrderId");
+                    }
+                    if (plateTag != null && plateTag.getBoolean(PlayerOrderManager.PLAYER_PACKAGE)) {
+                        startGoToPlayerPos(data, maid, plateTag);
+                        return;
+                    }
+                    LivingEntity customer = null;
+                    if (!orderId.isEmpty()) {
+                        customer = findCustomerByOrderId(level, counterPos, orderId);
+                    }
+                    if (customer == null) {
+                        MaidRestaurantAutomation.LOGGER.warn("送餐: 未找到匹配顾客 orderId={}, 结束任务", orderId);
+                        MaidChatBubbleHelper.waiterCustomerNotFound(maid);
+                        finishDelivery(maid, false);
+                        return;
+                    }
+                    data.putString(TAG_CUSTOMER_ID, CustomerCompat.getCustomerId(customer));
+                    data.putInt(TAG_STAGE, STAGE_GO_TO_CUSTOMER);
+                    BlockPos targetPos = findSafeDeliveryPos(level, customer.blockPosition());
+                    maid.getBrain().setMemory(MemoryModuleType.WALK_TARGET, new WalkTarget(targetPos, (float)MOVEMENT_SPEED, 1));
+                } else {
+                    // 没有餐盘，尝试拿取玩家订单包裹
+                    ItemStack takeoutBag = pickUpTakeoutBag(level, counterPos, maid);
+                    if (!takeoutBag.isEmpty()) {
+                        // 玩家订单包裹：直接送到玩家送餐点
+                        CompoundTag bagTag0 = takeoutBag.getTag();
+                        if (bagTag0 != null && bagTag0.getBoolean(PlayerOrderManager.PLAYER_PACKAGE)) {
+                            startGoToPlayerPos(data, maid, bagTag0);
+                            return;
+                        }
+                        // 非玩家包裹的袋子（OTC 外卖订单）已不再处理：放回并结束
+                        MaidRestaurantAutomation.LOGGER.warn("送餐: 操作台出现非玩家包裹的外卖袋，已忽略（本附属不做外卖）");
+                        finishDelivery(maid, false);
+                        return;
+                    } else {
+                        // 侍者超时订单顶替（开发文档 4.3⑥）：操作台被过期订单占用时无视并顶替，
+                        // 由调度显示器统一把该过期订单标记 FAILED 并释放台面；侍者只负责"顶替"、不负责清理。
+                        com.icewolf.maidrestaurant.automation.core.DispatcherLogic.forceExpireCounterOrder(level, counterPos);
+                        // 既没有餐盘也没有外卖袋，增加重试计数
+                        int retry = data.getInt(TAG_PLATE_PICKUP_RETRY) + 1;
+                        data.putInt(TAG_PLATE_PICKUP_RETRY, retry);
+                        if (retry >= MAX_PLATE_PICKUP_RETRY) {
+                            MaidRestaurantAutomation.LOGGER.warn("送餐: 女仆 {} 连续 {} 次未拿到餐盘/外卖袋，放弃任务",
+                                maid.getName().getString(), retry);
+                            finishDelivery(maid, false);
+                            return;
+                        }
+                        maid.getBrain().setMemory(MemoryModuleType.WALK_TARGET, new WalkTarget(counterPos, (float)MOVEMENT_SPEED, 1));
+                    }
+                }
+            } else {
+                if (data.contains(TAG_PLATE_PICKUP_RETRY)) {
+                    data.remove(TAG_PLATE_PICKUP_RETRY);
+                }
+                maid.getBrain().setMemory(MemoryModuleType.WALK_TARGET, new WalkTarget(counterPos, (float)MOVEMENT_SPEED, 1));
+            }
+        } else if (stage == STAGE_GO_TO_CUSTOMER) {
+            String customerId = data.getString(TAG_CUSTOMER_ID);
+            LivingEntity customer = findCustomerById(level, counterPos, customerId);
+            if (customer == null) {
+                MaidRestaurantAutomation.LOGGER.warn("送餐: 女仆 {} 找不到顾客 customerId={}, 立即结束任务", maid.getName().getString(), customerId);
+                MaidChatBubbleHelper.waiterCustomerNotFound(maid);
+                finishDelivery(maid, false);
+                return;
+            }
+            // 顾客消失检测：顾客是否还活着
+            if (!customer.isAlive()) {
+                MaidRestaurantAutomation.LOGGER.warn("送餐: 女仆 {} 的顾客 {} 已死亡，立即结束任务", maid.getName().getString(), customerId);
+                finishDelivery(maid, false);
+                return;
+            }
+            BlockPos customerPos = customer.blockPosition();
+            BlockPos targetPos = findSafeDeliveryPos(level, customerPos);
+            double dist = maid.distanceToSqr(targetPos.getX() + 0.5, targetPos.getY(), targetPos.getZ() + 0.5);
+            // 详细调试日志：每20tick输出一次
+            if (maid.tickCount % 20 == 0) {
+            }
+            if (dist <= CLOSE_ENOUGH_DIST * CLOSE_ENOUGH_DIST * 2.25) {
+                deliverToCustomer(level, maid, customer, counterPos, manager);
+            } else {
+                maid.getBrain().setMemory(MemoryModuleType.WALK_TARGET, new WalkTarget(targetPos, (float)MOVEMENT_SPEED, 1));
+            }
+        } else if (stage == STAGE_GO_TO_PLAYER_POS) {
+            // 玩家订单：前往买家选定的送餐点
+            if (!data.contains(TAG_PLAYER_POS)) {
+                // 数据异常：找到女仆身上的玩家包裹，按送达失败半退并掉落
+                CombinedInvWrapper pinv0 = maid.getAvailableInv(false);
+                int s0 = findPlayerPackageSlot(pinv0);
+                if (s0 >= 0) {
+                    ItemStack pkg0 = pinv0.extractItem(s0, Integer.MAX_VALUE, false);
+                    PlayerOrderManager.handleDeliveryFailure(level, pkg0, maid);
+                }
+                finishDelivery(maid, false);
+                return;
+            }
+            CompoundTag dp = data.getCompound(TAG_PLAYER_POS);
+            BlockPos target = new BlockPos(dp.getInt("x"), dp.getInt("y"), dp.getInt("z"));
+            double pdist = maid.distanceToSqr(target.getX() + 0.5, target.getY() + 0.5, target.getZ() + 0.5);
+            if (pdist <= PLAYER_DELIVERY_PLACE_DIST * PLAYER_DELIVERY_PLACE_DIST) {
+                CombinedInvWrapper pinv = maid.getAvailableInv(false);
+                int slot = findPlayerPackageSlot(pinv);
+                if (slot < 0) {
+                    finishDelivery(maid, false);
+                    return;
+                }
+                ItemStack pkg = pinv.extractItem(slot, Integer.MAX_VALUE, false);
+                boolean ok = PlayerOrderManager.placePackageAt(level, pkg, target);
+                if (ok) {
+                    // 玩家订单送达成功
+                    manager.getActiveOrders().remove(counterPos);
+                    manager.getCounterToMachine().remove(counterPos);
+                    finishDelivery(maid, true);
+                } else {
+                    // 送餐点被占 / 容器满：半退结算，失效包裹掉落到世界由玩家拾取
+                    PlayerOrderManager.handleDeliveryFailure(level, pkg, maid);
+                    finishDelivery(maid, false);
+                }
+            } else {
+                maid.getBrain().setMemory(MemoryModuleType.WALK_TARGET, new WalkTarget(target, (float)MOVEMENT_SPEED, 1));
+            }
+        }
+    }
+
+    private static void startGoToPlayerPos(CompoundTag data, EntityMaid maid, CompoundTag packageTag) {
+        CompoundTag dp = packageTag.getCompound(PlayerOrderManager.PLAYER_DELIVERY_POS);
+        data.put(TAG_PLAYER_POS, dp);
+        data.putInt(TAG_STAGE, STAGE_GO_TO_PLAYER_POS);
+        BlockPos target = new BlockPos(dp.getInt("x"), dp.getInt("y"), dp.getInt("z"));
+        maid.getBrain().setMemory(MemoryModuleType.WALK_TARGET, new WalkTarget(target, (float)MOVEMENT_SPEED, 1));
+    }
+
+    private static int findPlayerPackageSlot(CombinedInvWrapper inv) {
+        for (int i = 0; i < inv.getSlots(); i++) {
+            ItemStack s = inv.getStackInSlot(i);
+            CompoundTag t = s.getTag();
+            if (t != null && t.getBoolean(PlayerOrderManager.PLAYER_PACKAGE)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static void deliverToCustomer(ServerLevel level, EntityMaid maid, LivingEntity customer, BlockPos counterPos, BusinessManager manager) {
+        // TaskManager：标记开始交互
+        TaskManager.getInstance().startInteraction(maid.getUUID());
+
+        CombinedInvWrapper inv = maid.getAvailableInv(false);
+        if (inv == null) {
+            finishDelivery(maid, false);
+            return;
+        }
+        int plateSlot = -1;
+        ItemStack plateStack = ItemStack.EMPTY;
+        for (int i = 0; i < inv.getSlots(); ++i) {
+            ItemStack s = inv.getStackInSlot(i);
+            if (s.isEmpty() || !s.is((Item) OtcCompat.FOOD_PLATE())) continue;
+            plateSlot = i;
+            plateStack = s;
+            break;
+        }
+        if (plateStack.isEmpty()) {
+            MaidRestaurantAutomation.LOGGER.warn("送餐: 女仆背包中没有餐盘");
+            finishDelivery(maid, false);
+            return;
+        }
+
+        // 检查订单匹配
+        String plateOrderId = "";
+        CompoundTag plateTag = plateStack.getTag();
+        if (plateTag != null && plateTag.contains("OrderId")) {
+            plateOrderId = plateTag.getString("OrderId");
+        }
+        if (!plateOrderId.isEmpty()) {
+            boolean customerMatches = CustomerCompat.hasOrderTag(customer, plateOrderId);
+            if (!customerMatches) {
+                LivingEntity correctCustomer = findCustomerByOrderId(level, counterPos, plateOrderId);
+                if (correctCustomer != null) {
+                    customer = correctCustomer;
+                } else {
+                    MaidRestaurantAutomation.LOGGER.warn("送餐: 没有匹配顾客 orderId={}", plateOrderId);
+                    finishDelivery(maid, false);
+                    return;
+                }
+            }
+        }
+
+        // 使用女仆主人身份交付
+        Player deliverPlayer = getMaidOwner(level, maid);
+        boolean isRealPlayer = deliverPlayer != null;
+        if (deliverPlayer == null) {
+            deliverPlayer = FakePlayerFactory.get((ServerLevel) level, (GameProfile) new GameProfile(UUID.randomUUID(), "MaidWaiter"));
+            deliverPlayer.moveTo(maid.getX(), maid.getY(), maid.getZ(), maid.getYRot(), maid.getXRot());
+        }
+
+        InteractionResult result = TakeoutBagItem.trySubmitDineInFromEntityUse((ServerLevel) level, (Player) deliverPlayer, (ItemStack) plateStack.copy(), (Entity) customer);
+        if (result.consumesAction()) {
+            inv.extractItem(plateSlot, 1, false);
+            manager.getActiveOrders().remove(counterPos);
+            manager.getCounterToMachine().remove(counterPos);
+            // 好感度收益加成
+            applyFavorabilityBonus(level, maid, plateStack, deliverPlayer);
+            // 显示送餐完成气泡
+            try {
+                com.icewolf.maidrestaurant.automation.util.MaidChatBubbleHelper.waiterDeliveryDone(maid);
+            } catch (Exception e) {}
+            finishDelivery(maid, true);
+        } else {
+            // Fallback: 通过反射直接调用completeDelivery，确保收益发放
+            MaidRestaurantAutomation.LOGGER.warn("送餐: API交付失败 result={}, 尝试反射调用completeDelivery", result);
+            try {
+                CompoundTag nbt = plateStack.getTag();
+                if (nbt != null) {
+                    // 使用更灵活的方式查找completeDelivery方法（兼容Forge和Fabric的不同参数类型）
+                    Method completeDelivery = findCompleteDeliveryMethod();
+                    if (completeDelivery != null) {
+                        completeDelivery.setAccessible(true);
+                        completeDelivery.invoke(null, level, deliverPlayer, plateStack, nbt, (Entity) customer);
+                        inv.extractItem(plateSlot, 1, false);
+                        manager.getActiveOrders().remove(counterPos);
+                        manager.getCounterToMachine().remove(counterPos);
+                        // 好感度收益加成
+                        applyFavorabilityBonus(level, maid, plateStack, deliverPlayer);
+                        // 显示送餐完成气泡
+                        try {
+                            com.icewolf.maidrestaurant.automation.util.MaidChatBubbleHelper.waiterDeliveryDone(maid);
+                        } catch (Exception e) {}
+                        finishDelivery(maid, true);
+                    } else {
+                        // 终极回退：手动发放收益
+                        MaidRestaurantAutomation.LOGGER.warn("送餐: 无法找到completeDelivery方法，手动发放收益");
+                        manuallyGiveReward(level, deliverPlayer, plateStack, nbt);
+                        inv.extractItem(plateSlot, 1, false);
+                        manager.getActiveOrders().remove(counterPos);
+                        manager.getCounterToMachine().remove(counterPos);
+                        // 好感度收益加成
+                        applyFavorabilityBonus(level, maid, plateStack, deliverPlayer);
+                        finishDelivery(maid, true);
+                    }
+                } else {
+                    MaidRestaurantAutomation.LOGGER.error("送餐: 餐盘没有NBT数据，无法交付");
+                    finishDelivery(maid, false);
+                }
+            } catch (Throwable t) {
+                MaidRestaurantAutomation.LOGGER.error("送餐: 反射调用completeDelivery失败", t);
+                // 终极回退：手动发放收益
+                try {
+                    CompoundTag nbt = plateStack.getTag();
+                    if (nbt != null) {
+                        MaidRestaurantAutomation.LOGGER.warn("送餐: 反射失败，手动发放收益");
+                        manuallyGiveReward(level, deliverPlayer, plateStack, nbt);
+                        inv.extractItem(plateSlot, 1, false);
+                        manager.getActiveOrders().remove(counterPos);
+                        manager.getCounterToMachine().remove(counterPos);
+                        // 好感度收益加成
+                        applyFavorabilityBonus(level, maid, plateStack, deliverPlayer);
+                    }
+                } catch (Throwable t2) {
+                    MaidRestaurantAutomation.LOGGER.error("送餐: 手动发放收益也失败", t2);
+                }
+                finishDelivery(maid, false);
+            }
+        }
+    }
+
+    private static Player getMaidOwner(ServerLevel level, EntityMaid maid) {
+        try {
+            // 直接调用getOwnerUUID()（EntityMaid继承自TamableAnimal，该方法是public的）
+            UUID ownerUuid = maid.getOwnerUUID();
+            if (ownerUuid == null) {
+                MaidRestaurantAutomation.LOGGER.warn("送餐: maid.getOwnerUUID()返回null");
+                return null;
+            }
+            
+            if (level.getServer() != null) {
+                ServerPlayer realPlayer = level.getServer().getPlayerList().getPlayer(ownerUuid);
+                if (realPlayer != null) {
+                    return realPlayer;
+                }
+                // 真实玩家不在线，创建使用主人UUID的FakePlayer
+                GameProfile profile = new GameProfile(ownerUuid, "MaidOwner");
+                FakePlayer fakePlayer = FakePlayerFactory.get(level, profile);
+                fakePlayer.moveTo(maid.getX(), maid.getY(), maid.getZ(), maid.getYRot(), maid.getXRot());
+                return fakePlayer;
+            }
+        } catch (Throwable t) {
+            MaidRestaurantAutomation.LOGGER.warn("送餐: 获取主人失败", t);
+        }
+        return null;
+    }
+
+    private static void finishDelivery(EntityMaid maid, boolean success) {
+        
+        // TaskManager：完成或失败任务
+        if (success) {
+            TaskManager.getInstance().completeTask(maid.getUUID());
+        } else {
+            TaskManager.getInstance().failTask(maid.getUUID(), "delivery failed");
+        }
+
+        CompoundTag data = maid.getPersistentData();
+        if (!success) {
+            // 失败时清除女仆背包中的餐盘，避免卡住
+            CombinedInvWrapper maidInv = maid.getAvailableInv(false);
+            if (maidInv != null) {
+                int removedPlates = 0;
+                for (int i = 0; i < maidInv.getSlots(); ++i) {
+                    ItemStack stack = maidInv.getStackInSlot(i);
+                    if (stack.isEmpty() || !stack.is((Item) OtcCompat.FOOD_PLATE())) continue;
+                    maidInv.extractItem(i, stack.getCount(), false);
+                    removedPlates++;
+                    break;
+                }
+                if (removedPlates > 0) {
+                }
+            }
+        }
+        
+        // 防卡死：强制重置女仆状态（确保不会因为任务失败而卡住）
+        TaskSafetyUtils.resetMaidState(maid);
+        
+        // 验证状态是否已清除
+    }
+
+    /**
+     * 灵活查找completeDelivery方法（兼容Forge和Fabric的不同参数类型）
+     */
+    private static Method findCompleteDeliveryMethod() {
+        try {
+            Method[] methods = TakeoutBagItem.class.getDeclaredMethods();
+            for (Method m : methods) {
+                if (m.getName().equals("completeDelivery") && m.getParameterCount() == 5) {
+                    return m;
+                }
+            }
+        } catch (Throwable t) {
+            MaidRestaurantAutomation.LOGGER.error("查找completeDelivery方法失败", t);
+        }
+        return null;
+    }
+
+    /**
+     * 手动发放收益（当反射调用 completeDelivery 失败时的终极回退）。
+     * 必须真正调用 OTC 的 CoinUtils.giveCoins 发钱；若发钱 API 不可用则不发“到账”消息，避免玩家看到虚假到账提示。
+     */
+    private static void manuallyGiveReward(ServerLevel level, Player player, ItemStack plateStack, CompoundTag nbt) {
+        try {
+            int baseCoin = nbt.contains("Prestige") ? nbt.getInt("Prestige") : 0;
+            boolean isUrgent = nbt.getBoolean("Urgent");
+            String customer = nbt.contains("CustomerName") ? nbt.getString("CustomerName") : "";
+            if (customer == null || customer.isBlank()) {
+                customer = net.minecraft.network.chat.Component.translatable("keyword.ordertocook.customer").getString();
+            }
+
+            // 小费按 OTC 配置计算（反射；读取失败则不计小费，但本金 Prestige 一定发放）
+            int tipCoin = computeFallbackTip(level, isUrgent);
+            int finalCoin = baseCoin + tipCoin;
+
+            boolean paid = invokeGiveCoins(player, finalCoin);
+            if (paid) {
+                // 记录声望（失败不影响收款）
+                invokeAddPrestige(player, finalCoin);
+                // 与 OTC 正常结算一致的到账提示（actionbar）
+                if (tipCoin > 0) {
+                    player.displayClientMessage(net.minecraft.network.chat.Component.translatable(
+                            "message.ordertocook.order_completed_with_tip", finalCoin, customer, tipCoin)
+                            .withStyle(net.minecraft.ChatFormatting.GOLD), false);
+                } else {
+                    player.displayClientMessage(net.minecraft.network.chat.Component.translatable(
+                            "message.ordertocook.order_complete", finalCoin)
+                            .withStyle(net.minecraft.ChatFormatting.GOLD), false);
+                }
+            } else {
+                MaidRestaurantAutomation.LOGGER.error("送餐: 兜底发薪失败，未能向 {} 发放 {} 金币（已避免虚假到账提示）", player.getName().getString(), finalCoin);
+            }
+
+            // 消耗餐盘（与 OTC completeDelivery 末尾的 stack.shrink(1) 对齐）
+            plateStack.shrink(1);
+        } catch (Throwable t) {
+            MaidRestaurantAutomation.LOGGER.error("手动发放收益失败", t);
+        }
+    }
+
+    // ===== OTC 收益 API 反射缓存（跨版本解耦，避免直接引用字段在运行期类型不一致） =====
+    private static Method coinGiveMethod;
+    private static boolean coinGiveResolved;
+    private static Method prestigeAddMethod;
+    private static boolean prestigeResolved;
+
+    private static boolean invokeGiveCoins(Player player, int amount) {
+        if (amount <= 0) return true;
+        if (!coinGiveResolved) {
+            coinGiveResolved = true;
+            try {
+                Class<?> coinUtils = Class.forName("cn.breezeth.ordertocook.util.CoinUtils");
+                coinGiveMethod = coinUtils.getMethod("giveCoins", Player.class, int.class);
+            } catch (Throwable t) {
+                MaidRestaurantAutomation.LOGGER.warn("送餐: 未找到 OTC CoinUtils.giveCoins，兜底收益将无法发放", t);
+            }
+        }
+        if (coinGiveMethod == null) return false;
+        try {
+            coinGiveMethod.invoke(null, player, amount);
+            return true;
+        } catch (Throwable t) {
+            MaidRestaurantAutomation.LOGGER.error("送餐: 调用 CoinUtils.giveCoins 失败", t);
+            return false;
+        }
+    }
+
+    private static void invokeAddPrestige(Player player, int amount) {
+        if (amount <= 0) return;
+        if (!prestigeResolved) {
+            prestigeResolved = true;
+            try {
+                Class<?> prestigeManager = Class.forName("cn.breezeth.ordertocook.core.PrestigeManager");
+                prestigeAddMethod = prestigeManager.getMethod("addPlayerPrestige", Player.class, int.class);
+            } catch (Throwable ignored) {}
+        }
+        if (prestigeAddMethod == null) return;
+        try {
+            prestigeAddMethod.invoke(null, player, amount);
+        } catch (Throwable ignored) {}
+    }
+
+    /** 反射读取 OTC 配置计算小费，复刻 TakeoutBagItem.completeDelivery 的普通/急单/下雨逻辑；任何失败返回 0。 */
+    private static int computeFallbackTip(ServerLevel level, boolean isUrgent) {
+        try {
+            Class<?> cfgManager = Class.forName("cn.breezeth.ordertocook.config.ConfigManager");
+            Object cfg = cfgManager.getMethod("get").invoke(null);
+            if (cfg == null) return 0;
+            Class<?> cfgClass = cfg.getClass();
+            double chance = isUrgent ? reflectDouble(cfg, cfgClass, "tipUrgentChance") : reflectDouble(cfg, cfgClass, "tipNormalChance");
+            int min = level.isRaining() ? reflectInt(cfg, cfgClass, "rainTipMin") : reflectInt(cfg, cfgClass, "tipMin");
+            int max = level.isRaining() ? reflectInt(cfg, cfgClass, "rainTipMax") : reflectInt(cfg, cfgClass, "tipMax");
+            if (level.random.nextDouble() < chance) {
+                int span = Math.max(1, max - min + 1);
+                return min + level.random.nextInt(span);
+            }
+        } catch (Throwable ignored) {}
+        return 0;
+    }
+
+    private static double reflectDouble(Object cfg, Class<?> cfgClass, String name) throws Exception {
+        java.lang.reflect.Field f = findField(cfgClass, name);
+        return f != null ? f.getDouble(cfg) : 0.0;
+    }
+
+    private static int reflectInt(Object cfg, Class<?> cfgClass, String name) throws Exception {
+        java.lang.reflect.Field f = findField(cfgClass, name);
+        return f != null ? f.getInt(cfg) : 0;
+    }
+
+    private static java.lang.reflect.Field findField(Class<?> type, String name) {
+        for (Class<?> c = type; c != null; c = c.getSuperclass()) {
+            try {
+                java.lang.reflect.Field f = c.getDeclaredField(name);
+                f.setAccessible(true);
+                return f;
+            } catch (NoSuchFieldException ignored) {}
+        }
+        return null;
+    }
+
+    /**
+     * 好感度收益加成：根据女仆好感度等级给玩家额外金币
+     * 公共方法，供 DeliveryBridge 统一配送系统调用
+     */
+    public static void applyFavorabilityBonus(ServerLevel level, EntityMaid maid, ItemStack plateStack, Player deliverPlayer) {
+        try {
+            double bonusPerLevel = GameplayConfig.favorabilityBonus;
+            // 确定给哪个玩家发额外金币：优先女仆主人，其次deliverPlayer（如果是真实玩家）
+            Player bonusPlayer = getMaidOwner(level, maid);
+            if (bonusPlayer == null && deliverPlayer instanceof ServerPlayer) {
+                bonusPlayer = deliverPlayer;
+            }
+            if (bonusPerLevel > 0 && bonusPlayer != null) {
+                // 获取女仆好感度等级（0-3）
+                int favorability = maid.getFavorability();
+                int favorLevel = favorability < 64 ? 0 : (favorability < 192 ? 1 : (favorability < 384 ? 2 : 3));
+                if (favorLevel > 0) {
+                    // 从餐盘NBT中获取订单基础报酬
+                    CompoundTag plateTag = plateStack.getTag();
+                    int baseCoin = plateTag != null ? plateTag.getInt("Prestige") : 0;
+                    if (baseCoin > 0) {
+                        // 按好感度等级概率触发小费
+                        // 1级: 15%, 2级: 20%, 3级及以上: 30%
+                        double triggerChance;
+                        if (favorLevel >= 3) {
+                            triggerChance = 0.30;
+                        } else if (favorLevel == 2) {
+                            triggerChance = 0.20;
+                        } else {
+                            triggerChance = 0.15;
+                        }
+                        double roll = level.getRandom().nextDouble();
+                        if (roll > triggerChance) {
+                            return;
+                        }
+                        // 向上取整，确保至少给1金币
+                        int bonusCoin = (int)Math.ceil(baseCoin * favorLevel * bonusPerLevel);
+                        // 最高小费不超过基础收益的300%
+                        int maxBonus = baseCoin * 3;
+                        if (bonusCoin > maxBonus) {
+                            bonusCoin = maxBonus;
+                        }
+                        if (bonusCoin > 0) {
+                            // 给玩家额外金币
+                            Class<?> coinUtils = Class.forName("cn.breezeth.ordertocook.util.CoinUtils");
+                            java.lang.reflect.Method giveCoins = coinUtils.getMethod("giveCoins", net.minecraft.world.entity.player.Player.class, int.class);
+                            giveCoins.invoke(null, bonusPlayer, bonusCoin);
+                            // 发送可爱的提示句子
+                            String[] cuteMessages = {
+                                "因为女仆的可爱，顾客多给了" + bonusCoin + "小费~",
+                                "女仆的微笑暴击，额外获得" + bonusCoin + "收益！",
+                                "被女仆的可爱治愈了，多付了" + bonusCoin + "~",
+                                "女仆的元气满满，顾客多给了" + bonusCoin + "小费！",
+                                "因为女仆的贴心服务，多拿了" + bonusCoin + "收益~"
+                            };
+                            String message = cuteMessages[level.getRandom().nextInt(cuteMessages.length)];
+                            bonusPlayer.displayClientMessage(net.minecraft.network.chat.Component.literal(message).withStyle(net.minecraft.ChatFormatting.LIGHT_PURPLE), false);
+                        }
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            MaidRestaurantAutomation.LOGGER.warn("好感度加成: failed", t);
+        }
+    }
+
+    private static BlockPos findCounterWithPlate(ServerLevel level, EntityMaid maid, BusinessManager manager) {
+        BlockPos maidPos = maid.blockPosition();
+        BlockPos nearest = null;
+        double nearestDist = Double.MAX_VALUE;
+
+        // 先尝试使用TaskManager的中心化检索缓存
+        List<BlockPos> countersWithPlates = TaskManager.getInstance().getCachedCountersWithPlates(level);
+        if (countersWithPlates != null && !countersWithPlates.isEmpty()) {
+            for (BlockPos counterPos : countersWithPlates) {
+                double dist = counterPos.distSqr((Vec3i) maidPos);
+                if (dist > 256.0) continue; // 16格范围内
+                if (dist < nearestDist) {
+                    nearestDist = dist;
+                    nearest = counterPos;
+                }
+            }
+            if (nearest != null) return nearest;
+        }
+
+        // 缓存为空或没有找到，使用原来的检索逻辑
+        int chunkX = maidPos.getX() >> 4;
+        int chunkZ = maidPos.getZ() >> 4;
+        for (int cx = chunkX - 2; cx <= chunkX + 2; ++cx) {
+            for (int cz = chunkZ - 2; cz <= chunkZ + 2; ++cz) {
+                LevelChunk chunk = level.getChunkSource().getChunkNow(cx, cz);
+                if (chunk == null) continue;
+                for (BlockPos pos : chunk.getBlockEntitiesPos()) {
+                    BlockEntity be = chunk.getBlockEntity(pos);
+                    if (!(be instanceof TakeoutBoxBlockEntity)) continue;
+                    BlockPos counterPos = pos.immutable();
+                    double dist = counterPos.distSqr((Vec3i) maidPos);
+                    if (dist > 256.0) continue;
+                    // 待配送餐盘在 OTC 中固定生成于操作台正上方(above())，只检查这一格，
+                    // 不再扫描周围 5x5x3，避免误收邻近操作台或顾客正在吃的餐盘
+                    BlockEntity plateBe = level.getBlockEntity(counterPos.above());
+                    if (plateBe instanceof FoodPlateBlockEntity plateEntity && !plateEntity.getPlateStack().isEmpty()) {
+                        if (dist < nearestDist) {
+                            nearestDist = dist;
+                            nearest = counterPos;
+                        }
+                    }
+                }
+            }
+        }
+        return nearest;
+    }
+
+    private static ItemStack pickUpPlate(ServerLevel level, BlockPos counterPos, EntityMaid maid) {
+        CombinedInvWrapper inv = maid.getAvailableInv(false);
+        if (inv == null) return ItemStack.EMPTY;
+        // 只从操作台正上方取待配送餐盘，与 findCounterWithPlate / OTC 装盘位置(above())一致
+        BlockPos abovePos = counterPos.above();
+        BlockEntity be = level.getBlockEntity(abovePos);
+        if (be instanceof FoodPlateBlockEntity plateBe) {
+            ItemStack plateStack = plateBe.getPlateStack().copy();
+            if (!plateStack.isEmpty()) {
+                ItemStack remainder = ItemHandlerHelper.insertItemStacked((IItemHandler) inv, (ItemStack) plateStack, true);
+                if (!remainder.isEmpty()) {
+                    MaidRestaurantAutomation.LOGGER.warn("送餐: 女仆背包已满, 无法拿起餐盘");
+                    return ItemStack.EMPTY;
+                }
+                plateBe.setPlateStack(ItemStack.EMPTY);
+                level.removeBlock(abovePos, false);
+                ItemHandlerHelper.insertItemStacked((IItemHandler) inv, (ItemStack) plateStack, false);
+                return plateStack;
+            }
+        }
+        return ItemStack.EMPTY;
+    }
+
+    private static LivingEntity findCustomerByOrderId(ServerLevel level, BlockPos counterPos, String orderId) {
+        return CustomerCompat.findCustomerByOrderId(level, counterPos, orderId, 32.0);
+    }
+
+    private static LivingEntity findCustomerById(ServerLevel level, BlockPos counterPos, String customerId) {
+        return CustomerCompat.findCustomerById(level, counterPos, customerId, 32.0);
+    }
+
+    private static BlockPos findSafeDeliveryPos(ServerLevel level, BlockPos customerPos) {
+        if (isChairBlock(level, customerPos)) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                for (int dz = -1; dz <= 1; ++dz) {
+                    if (dx == 0 && dz == 0) continue;
+                    BlockPos checkPos = customerPos.offset(dx, 0, dz);
+                    if (isChairBlock(level, checkPos)) continue;
+                    if (!level.getBlockState(checkPos).isAir()) continue;
+                    return checkPos;
+                }
+            }
+        }
+        return customerPos;
+    }
+
+    private static boolean isChairBlock(ServerLevel level, BlockPos pos) {
+        try {
+            BlockState state = level.getBlockState(pos);
+            String blockName = ForgeRegistries.BLOCKS.getKey(state.getBlock()).toString();
+            return blockName.equals("ordertocook:chair") || blockName.contains("chair");
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    // ========== 外卖配送（酒狐速递站） ==========
+
+    /**
+     * 查找操作台上的外卖袋
+     */
+    private static BlockPos findCounterWithTakeoutBag(ServerLevel level, EntityMaid maid, BusinessManager manager) {
+        BlockPos maidPos = maid.blockPosition();
+        BlockPos nearest = null;
+        double nearestDist = Double.MAX_VALUE;
+
+        // 先尝试 TaskManager 中心化检索缓存（24格内最近），未命中再走原 chunk 扫描兜底
+        List<BlockPos> countersWithBags = TaskManager.getInstance().getCachedCountersWithTakeoutBags(level);
+        if (countersWithBags != null && !countersWithBags.isEmpty()) {
+            for (BlockPos counterPos : countersWithBags) {
+                double dist = counterPos.distSqr((Vec3i) maidPos);
+                if (dist > 576.0) continue; // 24格范围内
+                if (dist < nearestDist) {
+                    nearestDist = dist;
+                    nearest = counterPos;
+                }
+            }
+            if (nearest != null) return nearest;
+        }
+
+        int chunkX = maidPos.getX() >> 4;
+        int chunkZ = maidPos.getZ() >> 4;
+        for (int cx = chunkX - 2; cx <= chunkX + 2; ++cx) {
+            for (int cz = chunkZ - 2; cz <= chunkZ + 2; ++cz) {
+                LevelChunk chunk = level.getChunkSource().getChunkNow(cx, cz);
+                if (chunk == null) continue;
+                for (BlockPos pos : chunk.getBlockEntitiesPos()) {
+                    BlockEntity be = chunk.getBlockEntity(pos);
+                    // 只查找TakeoutBoxBlockEntity（外卖袋放在它上面，和餐盘一样）
+                    if (!(be instanceof TakeoutBoxBlockEntity)) continue;
+                    BlockPos counterPos = pos.immutable();
+                    double dist = counterPos.distSqr((Vec3i) maidPos);
+                    if (dist > 576.0) continue; // 24格范围内
+                    // 检查操作台是否有外卖袋（包括物品栏和掉落物）
+                    if (hasTakeoutBagInCounter(level, counterPos)) {
+                        if (dist < nearestDist) {
+                            nearestDist = dist;
+                            nearest = counterPos;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 注意：不再把地上的外卖袋掉落物坐标当作操作台返回——掉落物位置不是 TakeoutBoxBlockEntity，
+        // 女仆导航过去后交互必失败、只会朝空地空跑。操作台 3 格内的掉落物兜底已在 hasTakeoutBagInCounter 处理。
+        return nearest;
+    }
+
+    /**
+     * 检查操作台是否有外卖袋
+     */
+    private static boolean hasTakeoutBagInCounter(ServerLevel level, BlockPos counterPos) {
+        try {
+            // 只检查操作台正上方一个格子（打包好的外卖袋就在这里），与 findCounterWithTakeoutBag /
+            // pickUpTakeoutBag / OTC 打包位置(above())一致。不再扫描周围 5x3x5，避免误收邻近操作台
+            // 或顾客掉落的外卖袋；地面掉落物兜底一并移除，与餐盘逻辑（无 dropped-item 兜底）保持一致。
+            BlockPos abovePos = counterPos.above();
+            BlockEntity be = level.getBlockEntity(abovePos);
+            if (be == null) return false;
+            ItemStack bagStack = getTakeoutBagStack(be);
+            return !bagStack.isEmpty() && isTakeoutBag(bagStack);
+        } catch (Exception e) {
+            MaidRestaurantAutomation.LOGGER.error("外卖检测错误: {}", e.toString());
+        }
+        return false;
+    }
+    
+    /**
+     * 从外卖袋BlockEntity中获取物品栈（参考FoodPlateBlockEntity.getPlateStack）
+     */
+    static ItemStack getTakeoutBagStack(BlockEntity be) {
+        try {
+            // 尝试通过方法名获取
+            for (java.lang.reflect.Method m : be.getClass().getMethods()) {
+                if (m.getName().equals("getBagStack") || m.getName().equals("getTakeoutStack") || 
+                    m.getName().equals("getItemStack") || m.getName().equals("getPlateStack")) {
+                    Object result = m.invoke(be);
+                    if (result instanceof ItemStack) {
+                        return (ItemStack) result;
+                    }
+                }
+            }
+            // 如果实现了Container接口，检查第一个格子
+            if (be instanceof net.minecraft.world.Container container) {
+                for (int i = 0; i < Math.min(container.getContainerSize(), 5); i++) {
+                    ItemStack stack = container.getItem(i);
+                    if (!stack.isEmpty() && isTakeoutBag(stack)) {
+                        return stack;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // 静默失败
+        }
+        return ItemStack.EMPTY;
+    }
+
+    /**
+     * 检查物品是否是外卖袋
+     */
+    static boolean isTakeoutBag(ItemStack stack) {
+        if (stack.isEmpty()) return false;
+        try {
+            return stack.getItem() instanceof TakeoutBagItem;
+        } catch (Throwable t) {
+            String itemName = ForgeRegistries.ITEMS.getKey(stack.getItem()).toString();
+            return itemName.contains("takeout") || itemName.contains("bag");
+        }
+    }
+
+    /**
+     * 从操作台拿取外卖袋
+     */
+    private static ItemStack pickUpTakeoutBag(ServerLevel level, BlockPos counterPos, EntityMaid maid) {
+        CombinedInvWrapper inv = maid.getAvailableInv(false);
+        if (inv == null) return ItemStack.EMPTY;
+        // 只从操作台正上方取外卖袋，与 findCounterWithTakeoutBag / OTC 打包位置(above())一致。
+        // 不再扫描周围 5x3x5、也不扫地面掉落物，避免跑到邻近操作台或空地拿错袋（参考 pickUpPlate 单格逻辑）。
+        BlockPos abovePos = counterPos.above();
+        BlockEntity be = level.getBlockEntity(abovePos);
+        if (be == null) return ItemStack.EMPTY;
+        ItemStack bagStack = getTakeoutBagStack(be);
+        if (bagStack.isEmpty() || !isTakeoutBag(bagStack)) return ItemStack.EMPTY;
+        ItemStack copy = bagStack.copy();
+        ItemStack remainder = ItemHandlerHelper.insertItemStacked((IItemHandler) inv, copy, true);
+        if (!remainder.isEmpty()) {
+            MaidRestaurantAutomation.LOGGER.warn("外卖配送: 女仆背包已满, 无法拿起外卖袋");
+            return ItemStack.EMPTY;
+        }
+        // 清空外卖袋BlockEntity并移除（参考餐盘的处理方式）
+        clearTakeoutBag(be, abovePos, level);
+        ItemHandlerHelper.insertItemStacked((IItemHandler) inv, copy, false);
+        return copy;
+    }
+    
+    /**
+     * 清空外卖袋BlockEntity（参考plateBe.setPlateStack + removeBlock）
+     */
+    private static void clearTakeoutBag(BlockEntity be, BlockPos pos, ServerLevel level) {
+        try {
+            // 尝试通过方法名设置为空
+            for (java.lang.reflect.Method m : be.getClass().getMethods()) {
+                if (m.getName().equals("setBagStack") || m.getName().equals("setTakeoutStack") || 
+                    m.getName().equals("setItemStack") || m.getName().equals("setPlateStack")) {
+                    m.invoke(be, ItemStack.EMPTY);
+                    break;
+                }
+            }
+            // 移除方块（参考餐盘的处理方式）
+            level.removeBlock(pos, false);
+        } catch (Exception e) {
+            // 静默失败
+        }
+    }
+}

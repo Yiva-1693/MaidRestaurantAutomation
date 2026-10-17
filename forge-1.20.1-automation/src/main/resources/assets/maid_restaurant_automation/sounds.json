@@ -1,0 +1,11 @@
+{
+  "closing_bell": {
+    "subtitle": "maid_restaurant_automation.subtitle.closing_bell",
+    "sounds": [
+      {
+        "name": "maid_restaurant_automation:closing_bell",
+        "stream": false
+      }
+    ]
+  }
+}

@@ -1,0 +1,102 @@
+package com.icewolf.maidrestaurant.automation;
+
+import com.icewolf.maidrestaurant.automation.config.BatchCookingConfig;
+import com.icewolf.maidrestaurant.automation.config.AutomationConfig;
+import com.icewolf.maidrestaurant.automation.config.GameplayConfig;
+import com.icewolf.maidrestaurant.automation.config.PerformanceConfig;
+import com.icewolf.maidrestaurant.automation.config.TaskSafetyConfig;
+import com.icewolf.maidrestaurant.automation.core.ActivationCache;
+import com.icewolf.maidrestaurant.automation.core.BusinessManager;
+import com.icewolf.maidrestaurant.automation.core.RuntimeState;
+import com.icewolf.maidrestaurant.automation.network.ModMessages;
+import com.icewolf.maidrestaurant.automation.registry.ModBlockEntities;
+import com.icewolf.maidrestaurant.automation.registry.ModBlocks;
+import com.icewolf.maidrestaurant.automation.registry.ModCreativeTabs;
+import com.icewolf.maidrestaurant.automation.registry.ModItems;
+import com.icewolf.maidrestaurant.automation.registry.ModMenuTypes;
+import com.icewolf.maidrestaurant.automation.registry.ModSounds;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraftforge.common.MinecraftForge;
+import net.minecraftforge.event.TickEvent;
+import net.minecraftforge.event.level.LevelEvent;
+import net.minecraftforge.event.server.ServerStartingEvent;
+import net.minecraftforge.event.server.ServerStoppingEvent;
+import net.minecraftforge.eventbus.api.IEventBus;
+import net.minecraftforge.eventbus.api.SubscribeEvent;
+import net.minecraftforge.fml.ModLoadingContext;
+import net.minecraftforge.fml.common.Mod;
+import net.minecraftforge.fml.config.IConfigSpec;
+import net.minecraftforge.fml.config.ModConfig;
+import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
+@Mod(value="maid_restaurant_automation")
+public class MaidRestaurantAutomation {
+    public static final String MOD_ID = "maid_restaurant_automation";
+    public static final Logger LOGGER = LogManager.getLogger((String)"MaidRestaurantAutomation");
+    private static BusinessManager manager;
+
+    public MaidRestaurantAutomation() {
+        IEventBus modEventBus = FMLJavaModLoadingContext.get().getModEventBus();
+        ModItems.register(modEventBus);
+        ModBlocks.register(modEventBus);
+        ModBlockEntities.register(modEventBus);
+        ModMenuTypes.register(modEventBus);
+        ModCreativeTabs.register(modEventBus);
+        ModSounds.register(modEventBus);
+        ModMessages.register();
+        // OTC 公开订单生命周期监听（订单完成 / 过期 / 取消感知，无需 mixin）
+        com.icewolf.maidrestaurant.automation.core.DispatcherOrderEvents.register();
+        // 营业中的所有配置统一收纳到 config/maid_restaurant_automation/ 子文件夹，避免 config 根目录杂乱
+        // 自动化功能开关
+        ModLoadingContext.get().registerConfig(ModConfig.Type.COMMON, (IConfigSpec)AutomationConfig.SPEC, "maid_restaurant_automation/automation.toml");
+        // 玩法与成长（等级解锁/订单调度/收益加成/洗碗阈值/气泡冷却）
+        ModLoadingContext.get().registerConfig(ModConfig.Type.COMMON, (IConfigSpec)GameplayConfig.SPEC, "maid_restaurant_automation/gameplay.toml");
+        // 扫描范围与性能调试
+        ModLoadingContext.get().registerConfig(ModConfig.Type.COMMON, (IConfigSpec)PerformanceConfig.SPEC, "maid_restaurant_automation/performance.toml");
+        // 任务安全与超时保护配置
+        ModLoadingContext.get().registerConfig(ModConfig.Type.COMMON, (IConfigSpec)TaskSafetyConfig.SPEC, "maid_restaurant_automation/safety.toml");
+        // 酒狐速递站（外卖配送）已移除：本附属只做堂食
+        // 多槽厨具（蒸笼/烤箱/烤面包机/搅拌机）单任务批量烹饪配置
+        ModLoadingContext.get().registerConfig(ModConfig.Type.COMMON, (IConfigSpec)BatchCookingConfig.SPEC, "maid_restaurant_automation/batch_cooking.toml");
+        MinecraftForge.EVENT_BUS.register(this);
+    }
+
+    @SubscribeEvent
+    public void onServerStarting(ServerStartingEvent event) {
+        // 先重置上一存档残留的单例与 static 运行时态，再新建管理器（构造内会懒汉创建全新 TaskManager）
+        RuntimeState.onServerStarting();
+        manager = new BusinessManager(event.getServer());
+    }
+
+    @SubscribeEvent
+    public void onLevelLoad(LevelEvent.Load event) {
+        if (event.getLevel() instanceof ServerLevel serverLevel) {
+            ActivationCache.initLevel(serverLevel);
+        }
+    }
+
+    @SubscribeEvent
+    public void onLevelUnload(LevelEvent.Unload event) {
+        if (event.getLevel() instanceof ServerLevel serverLevel) {
+            ActivationCache.clearLevel(serverLevel);
+        }
+    }
+
+    @SubscribeEvent
+    public void onServerStopping(ServerStoppingEvent event) {
+        manager = null;
+    }
+
+    @SubscribeEvent
+    public void onServerTick(TickEvent.ServerTickEvent event) {
+        if (event.phase == TickEvent.Phase.END && manager != null) {
+            manager.tick(event.getServer());
+        }
+    }
+
+    public static BusinessManager getManager() {
+        return manager;
+    }
+}
