@@ -293,3 +293,12 @@ C:\Users\17602\.gradle\wrapper\dists\gradle-7.6.1-bin\b4g3gk9pknhvdxjrakfmqdm18\
    - 保留：`forge-1.20.1-automation/`（本模组）、`docs/DELIVERY_自动化附属_v1.md`、`tools/check_mixins.ps1`、`LICENSE`、`README.md`、`.gitignore`；
    - **Git 历史重建**：以孤儿提交（orphan branch）重建 `main`，只包含本项目文件，并 force push 覆盖远程 `https://github.com/Yiva-1693/MaidRestaurantAutomation`（上游克隆历史不再保留）。
    - 构建改用本机默认 Gradle 用户目录缓存（不再依赖已删除的 `forge-1.20.1/.gradle_repo`），离线构建验证通过。
+
+## 食物队列按订单分组 + 组内双列排版（v1.0.1）
+
+- **服务端**（`DispatcherLogic.buildSnapshot`）/ 食物条目新增 `"Order"`（订单组序号，组序=订单队列顺序）、`"OrderLabel"`（组标题，如 `★387 · wuyexianyu`）；组内生成顺序保持 制作中 → 已分配 → 待分配 → 已完成；取消全局 Flag 排序。
+- **GUI**（`DispatcherScreen`）：
+  - 食物队列改为**按订单分组**：每组先画一行组标题（沿用组标题 chip 风格：淡灰底+淡金边）；
+  - 组内条目**左右双列依次排列**（两条一行，从左到右再换行），每格紧凑显示 `▶ 菜名 → 厨师 / 待分配 / 已完成`；
+  - 组内按 Flag 稳定排序（制作中靠前、已完成最后）；布局高度、整页单滚动与滚动条同步适配。
+- 版本升 **1.0.1**，产物 `Maid Restaurant Automation-1.20.1-forge-1.0.1.jar`。

@@ -834,11 +834,14 @@ public final class DispatcherLogic {
         allOrders.sort((a, b) -> Integer.compare(b.prestige, a.prestige));
         List<CompoundTag> orderEntries = new ArrayList<>();
         List<CompoundTag> foodEntries = new ArrayList<>();
+        int orderIndex = 0;
         for (TrackedOrder order : allOrders) {
             if (!order.state.isActive() && order.state != OrderState.FAILED) continue;
             String remain = order.expiryTick > 0 ? remainTime(order.expiryTick, now) : "--:--";
             String handler = order.handledBy == null || order.handledBy.isEmpty() ? "" : order.handledBy;
             boolean received = handler.length() > 0 || order.counterPos != null;
+            int foodGroupIndex = orderIndex++;
+            String foodGroupLabel = "★" + order.prestige + " · " + order.customerName;
             CompoundTag orderEntry = new CompoundTag();
             orderEntry.putBoolean("Received", received);
             orderEntry.putInt("Price", order.prestige);
@@ -904,6 +907,8 @@ public final class DispatcherLogic {
                     }
                     foodEntry.putString("Assignee", assignee);
                     foodEntry.putInt("Flag", flag);
+                    foodEntry.putInt("Order", foodGroupIndex);
+                    foodEntry.putString("OrderLabel", foodGroupLabel);
                     foodEntries.add(foodEntry);
                 }
                 for (int i = 0; i < completedCount; i++) {
@@ -911,6 +916,8 @@ public final class DispatcherLogic {
                     foodEntry.putString("Dish", dishName);
                     foodEntry.putString("Assignee", "");
                     foodEntry.putInt("Flag", 3); // 已完成（在操作台）
+                    foodEntry.putInt("Order", foodGroupIndex);
+                    foodEntry.putString("OrderLabel", foodGroupLabel);
                     foodEntries.add(foodEntry);
                 }
             }
@@ -963,13 +970,14 @@ public final class DispatcherLogic {
             } catch (Throwable ignored) {
             }
         }
-        // 食物队列排序：制作中(0) → 已分配(1) → 待分配(2) → 已完成(3)
-        foodEntries.sort((a, b) -> Integer.compare(a.getInt("Flag"), b.getInt("Flag")));
+        // 食物队列：按订单分组输出（组序 = 订单队列顺序）；组内顺序即 制作中→已分配→待分配→已完成，不做全局排序
         if (foodEntries.isEmpty()) {
             CompoundTag placeholder = new CompoundTag();
             placeholder.putString("Dish", "暂无待制作食物");
             placeholder.putString("Assignee", "");
             placeholder.putInt("Flag", 2);
+            placeholder.putInt("Order", 0);
+            placeholder.putString("OrderLabel", "");
             foodEntries.add(placeholder);
         }
         // 订单队列：已接待在前、未接待在后；组内按价格降序

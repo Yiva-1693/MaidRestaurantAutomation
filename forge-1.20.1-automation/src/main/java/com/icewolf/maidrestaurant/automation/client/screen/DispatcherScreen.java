@@ -35,8 +35,10 @@ import net.minecraft.world.level.block.entity.BlockEntity;
  *     <li><b>订单队列</b>：按「已接待 / 未接待」分两组，每组一行 chip 组标题；订单两列对齐，
  *     左列「★价格 / 剩余时间 / 顾客」、右列「状态 / 处理侍者」，行带淡黑底、失败订单偏红，
  *     悬停显示 Hover1~3 三行信息。</li>
- *     <li><b>食物队列</b>：两列竖排，左列菜名（含 Flag 前缀色）、右列负责人 / 状态，
- *     列宽按内容自动测量并限制在可用宽度内。</li>
+ *     <li><b>食物队列</b>：按服务端 {@code "Order"} 分成订单组，每组先一行组标题 chip
+ *     （{@code §7 + OrderLabel}），组内条目两条一行、左右两列依次填充（左格 x = textX，
+ *     右格 x = textX + cellW + COLUMN_GAP，cellW = (可用宽度 - COLUMN_GAP) / 2）；
+ *     格子内为紧凑单行「菜名 → 负责人 / 状态」，超宽用省略号裁剪；食物行不参与悬停。</li>
  * </ul>
  *
  * <p>布局在 {@link #recomputeLayout()} 中每帧重新测量：所有 y 都以「滚动内容顶部」为原点
@@ -224,8 +226,8 @@ public class DispatcherScreen extends AbstractContainerScreen<DispatcherMenu> {
     private final List<CompoundTag> foodEntries = new ArrayList<>();
     /** 订单两列排版结果（按「已接待 → 未接待」分组后的绘制顺序）。 */
     private final List<OrderRow> orderRows = new ArrayList<>();
-    /** 食物两列排版结果（按服务端 Flag 升序）。 */
-    private final List<FoodRow> foodRows = new ArrayList<>();
+    /** 食物排版结果：按服务端 {@code "Order"} 分好的订单组（组标题 + 组内双列格子）。 */
+    private final List<FoodGroup> foodGroups = new ArrayList<>();
     /** 订单分组标题 / 计数 / 相对 y：数量为 0 的组也画标题（无任何订单时改为一行占位）。 */
     private int receivedOrderCount;
     private int unreceivedOrderCount;
@@ -236,11 +238,11 @@ public class DispatcherScreen extends AbstractContainerScreen<DispatcherMenu> {
     private int relReceivedOrderTitleY = -1;
     private int relUnreceivedOrderTitleY = -1;
     private int relOrderEmptyY = -1;
-    /** 两列列宽：布局阶段按内容测量并限制最大宽度，绘制阶段直接复用以保证逐行对齐。 */
+    /** 订单两列列宽：布局阶段按内容测量并限制最大宽度，绘制阶段直接复用以保证逐行对齐。 */
     private int orderLeftW;
     private int orderRightW;
-    private int foodLeftW;
-    private int foodRightW;
+    /** 食物格宽：cellW = (可用宽度 - COLUMN_GAP) / 2，左右两格共用。 */
+    private int foodCellW;
 
     // ==================== 本帧悬停的条目（renderBg 中更新，super.render 之后绘制悬浮框） ====================
     @Nullable
@@ -553,24 +555,30 @@ public class DispatcherScreen extends AbstractContainerScreen<DispatcherMenu> {
     }
 
     /**
-     * 食物队列：两列竖排（左列菜名、右列负责人 / 状态），行首不响应点击与悬停；
-     * 两列 x 坐标由布局阶段测量好的 {@link #foodLeftW} 决定，保证逐行对齐。
+     * 食物队列：按订单组绘制。每组先画一行组标题 chip（淡灰底 + 淡金边，与订单 /
+     * 员工分组标题同款），组内格子两条一行、从左到右填充：左格 x = {@code textX}，
+     * 右格 x = {@code textX} + {@link #foodCellW} + {@link #COLUMN_GAP}；
+     * 格子文本已在布局阶段按格宽裁剪。食物行不响应点击与悬停。
      */
     private void drawFoodRows(GuiGraphics graphics, int textX) {
-        if (this.foodRows.isEmpty()) {
+        if (this.foodGroups.isEmpty()) {
             graphics.drawString(this.font, "§7" + tr(KEY_EMPTY_FOOD),
                     textX, this.pageY(this.relFoodListTop) + 1, COLOR_TEXT);
             return;
         }
-        int rightX = textX + this.foodLeftW + COLUMN_GAP;
-        for (FoodRow row : this.foodRows) {
-            int rowY = this.pageY(row.relY);
-            if (rowY + FOOD_ROW_H < this.viewportTop || rowY > this.viewportBottom) {
-                continue;
+        for (FoodGroup group : this.foodGroups) {
+            int titleY = this.pageY(group.relTitleY);
+            if (titleY + CHIP_H >= this.viewportTop && titleY <= this.viewportBottom) {
+                this.drawChip(graphics, textX, titleY, group.titleWidth, group.title,
+                        COLOR_CHIP_GROUP_BG, COLOR_CHIP_GROUP_EDGE, false);
             }
-            graphics.drawString(this.font, row.left, textX, rowY + 1, COLOR_TEXT);
-            if (!row.right.isEmpty()) {
-                graphics.drawString(this.font, row.right, rightX, rowY + 1, COLOR_TEXT);
+            for (FoodCell cell : group.cells) {
+                int rowY = this.pageY(cell.relY);
+                if (rowY + FOOD_ROW_H < this.viewportTop || rowY > this.viewportBottom) {
+                    continue;
+                }
+                int cellX = textX + cell.column * (this.foodCellW + COLUMN_GAP);
+                graphics.drawString(this.font, cell.text, cellX, rowY + 1, COLOR_TEXT);
             }
         }
     }
@@ -605,7 +613,8 @@ public class DispatcherScreen extends AbstractContainerScreen<DispatcherMenu> {
      *           + Σ[2(组间距) + 12(组标题) + 12×组内 chip 行数] + [FOOTER_GAP + 10(页脚)] + 4(底白)
      * 订单区  = 14(标题区) + [12(已接待标题) + 12×已接待数 + 2(组间距)
      *           + 12(未接待标题) + 12×未接待数]（无订单时 11 占位行）+ 4(底白)
-     * 食物区  = 14(标题区) + 10×食物数 + 4(底白)（无食物时 11 占位行）
+     * 食物区  = 14(标题区) + Σ[12(订单组标题) + 10×(组内条数 / 2 向上取整) + 2(组间距)]
+     *           + 4(底白)（无食物时 11 占位行；组内两条一行）
      * 区块间隔 6(顶部→员工) / 5(员工→订单) / 5(订单→食物) / 4(整页底部)
      * </pre>
      *
@@ -728,11 +737,10 @@ public class DispatcherScreen extends AbstractContainerScreen<DispatcherMenu> {
         int orderH = this.layoutOrderRows(this.relOrderListTop, flowW);
         this.relOrderBottom = this.relOrderListTop + orderH + SECTION_BOTTOM_PAD;
 
-        // ---------- 7. 食物队列：两列对齐行 ----------
+        // ---------- 7. 食物队列：按订单分组 + 组内双列 ----------
         this.relFoodTop = this.relOrderBottom + SECTION_GAP;
         this.relFoodListTop = this.relFoodTop + SECTION_HEADER_H;
-        this.layoutFoodRows(this.relFoodListTop, flowW);
-        int foodH = this.foodRows.isEmpty() ? EMPTY_ROW_H : this.foodRows.size() * FOOD_ROW_H;
+        int foodH = this.layoutFoodRows(this.relFoodListTop, flowW);
         this.relFoodBottom = this.relFoodListTop + foodH + SECTION_BOTTOM_PAD;
 
         // ---------- 8. 整页高度与滚动范围 ----------
@@ -844,7 +852,7 @@ public class DispatcherScreen extends AbstractContainerScreen<DispatcherMenu> {
         this.flowHeight = this.chips.isEmpty() ? EMPTY_ROW_H : y - flowTop;
     }
 
-    // ==================== 订单 / 食物两列排版 ====================
+    // ==================== 订单两列 / 食物分组双列排版 ====================
 
     /**
      * 订单两列排版：按 {@code "Received"} 分成「已接待 / 未接待」两组（组内保持服务端顺序），
@@ -947,56 +955,81 @@ public class DispatcherScreen extends AbstractContainerScreen<DispatcherMenu> {
     }
 
     /**
-     * 食物两列排版：左列菜名（Flag 0 带金色 ▶ 前缀），右列负责人 / 状态；两列列宽按全部
-     * 条目内容测量后限制在 {@code maxW} 内，所有行共用同一组 x 坐标以保证逐行对齐。
+     * 食物排版：按服务端 {@code "Order"} 值分组（值变化即新组，同一订单的条目连续排列，
+     * 组顺序 = 订单队列顺序）。每组先占 {@link #GROUP_TITLE_H} 一行画组标题 chip
+     * （文字 {@code §7 + OrderLabel}，OrderLabel 为空时回退「订单」），组内条目先按
+     * {@code "Flag"} 做稳定排序（制作中 → 已分配 → 待分配 → 已完成，同 Flag 保持服务端
+     * 顺序），再两条一行填充：左格 column 0、右格 column 1，格宽
+     * {@code cellW = (maxW - COLUMN_GAP) / 2}；超宽文本按格宽
+     * {@link #clip(String, int)} 裁剪加省略号。每组末尾留 {@link #GROUP_GAP} 像素，
+     * 与 {@link #recomputeLayout()} 的高度公式一致。所有 y 相对滚动内容顶部。
+     *
+     * @return 食物列表区高度（不含区块底部留白）；空队列返回 {@link #EMPTY_ROW_H}
      */
-    private void layoutFoodRows(int listTop, int maxW) {
-        this.foodRows.clear();
-        int naturalLeft = 0;
-        int naturalRight = 0;
-        for (CompoundTag entry : this.foodEntries) {
-            int flag = entry.getInt("Flag");
-            String dish = nullToEmpty(entry.getString("Dish"));
-            String assignee = nullToEmpty(entry.getString("Assignee"));
-            String left;
-            String right;
-            switch (flag) {
-                case 0:
-                    // 制作中：左列金色 ▶ + 菜名，右列厨师名 + 黄色状态
-                    left = "§6▶ §b" + dish;
-                    right = assignee.isEmpty() ? "§8待分配" : "§a" + assignee + " §e(制作中)";
-                    break;
-                case 1:
-                    // 已分配
-                    left = "§b" + dish;
-                    right = assignee.isEmpty() ? "§8待分配" : "§a" + assignee;
-                    break;
-                case 3:
-                    // 已完成（在操作台）
-                    left = "§7" + dish;
-                    right = "§a已完成";
-                    break;
-                case 2:
-                default:
-                    // 待分配
-                    left = "§b" + dish;
-                    right = "§8待分配";
-                    break;
-            }
-            this.foodRows.add(new FoodRow(left, right));
-            naturalLeft = Math.max(naturalLeft, this.plainWidth(left));
-            naturalRight = Math.max(naturalRight, this.plainWidth(right));
+    private int layoutFoodRows(int listTop, int maxW) {
+        this.foodGroups.clear();
+        this.foodCellW = Math.max(8, (maxW - COLUMN_GAP) / 2);
+        if (this.foodEntries.isEmpty()) {
+            return EMPTY_ROW_H;
         }
 
-        int[] columns = fitTwoColumns(maxW, naturalLeft, naturalRight);
-        this.foodLeftW = columns[0];
-        this.foodRightW = columns[1];
+        // ---------- 1. 按 "Order" 值变化分组；组内稍后按 Flag 稳定排序 ----------
+        FoodGroup group = null;
+        Integer lastOrder = null;
+        for (CompoundTag entry : this.foodEntries) {
+            int order = entry.getInt("Order");
+            if (lastOrder == null || order != lastOrder.intValue()) {
+                group = new FoodGroup(nullToEmpty(entry.getString("OrderLabel")));
+                this.foodGroups.add(group);
+                lastOrder = order;
+            }
+            int flag = entry.getInt("Flag");
+            group.cells.add(new FoodCell(this.clip(buildFoodCellText(entry), this.foodCellW), flag));
+        }
+
+        // ---------- 2. 组标题 + 组内双列排版（两条一行，先左后右） ----------
+        int titleMaxW = Math.max(8, maxW - CHIP_PAD_X * 2);
         int y = listTop;
-        for (FoodRow row : this.foodRows) {
-            row.left = this.clip(row.rawLeft, this.foodLeftW);
-            row.right = this.clip(row.rawRight, this.foodRightW);
-            row.relY = y;
-            y += FOOD_ROW_H;
+        for (FoodGroup foodGroup : this.foodGroups) {
+            // 稳定排序（List.sort 为稳定排序）：保证制作中靠前、已完成最后，同 Flag 不乱序
+            foodGroup.cells.sort((a, b) -> Integer.compare(a.flag, b.flag));
+            String label = foodGroup.label.trim().isEmpty() ? "订单" : foodGroup.label;
+            foodGroup.title = this.clip("§7" + label, titleMaxW);
+            foodGroup.titleWidth = this.plainWidth(foodGroup.title) + CHIP_PAD_X * 2;
+            foodGroup.relTitleY = y;
+            y += GROUP_TITLE_H;
+
+            int rowTop = y;
+            for (int i = 0; i < foodGroup.cells.size(); i++) {
+                FoodCell cell = foodGroup.cells.get(i);
+                cell.column = i % 2;
+                cell.relY = rowTop + (i / 2) * FOOD_ROW_H;
+            }
+            y = rowTop + ((foodGroup.cells.size() + 1) / 2) * FOOD_ROW_H;
+            y += GROUP_GAP;
+        }
+        return y - listTop;
+    }
+
+    /**
+     * 单条食物的紧凑单行文本：Flag 0 制作中 / 1 已分配 / 2 待分配 / 3 已完成（在操作台）。
+     * 0、1 缺少负责人时按「待分配」兜底，其他 Flag 一律按待分配处理。
+     */
+    private static String buildFoodCellText(CompoundTag entry) {
+        int flag = entry.getInt("Flag");
+        String dish = nullToEmpty(entry.getString("Dish"));
+        String assignee = nullToEmpty(entry.getString("Assignee"));
+        String chef = assignee.isEmpty() ? "§8待分配" : "§a" + assignee;
+        switch (flag) {
+            case 0:
+                return "§6▶ §b" + dish + " §8→ " + chef;
+            case 1:
+                return "§b" + dish + " §8→ " + chef;
+            case 3:
+                return "§7" + dish + " §8→ §a已完成";
+            case 2:
+            default:
+                return "§b" + dish + " §8→ §8待分配";
         }
     }
 
@@ -1473,19 +1506,35 @@ public class DispatcherScreen extends AbstractContainerScreen<DispatcherMenu> {
     }
 
     /**
-     * 一份食物的两列排版结果：左列菜名（含 Flag 前缀色）、右列负责人 / 状态；
-     * 列宽裁剪在布局阶段完成，绘制只需左列 x 与相对 y。食物行不参与 hover。
+     * 一个订单组：组标题原文（{@code "OrderLabel"}，可空）、裁剪后的 chip 文本 /
+     * 宽度 / 相对标题 y，以及组内双列格子（顺序为组内按 Flag 稳定排序后的绘制顺序）。
      */
-    private static final class FoodRow {
-        private final String rawLeft;
-        private final String rawRight;
-        private String left = "";
-        private String right = "";
+    private static final class FoodGroup {
+        private final String label;
+        private final List<FoodCell> cells = new ArrayList<>();
+        private String title = "";
+        private int titleWidth;
+        private int relTitleY;
+
+        private FoodGroup(String label) {
+            this.label = label;
+        }
+    }
+
+    /**
+     * 组内一个格子：绘制文本（布局阶段已按格宽裁剪）、Flag（仅用于组内稳定排序）、
+     * 列号（0 = 左格 / 1 = 右格）、相对滚动内容顶部的 y。
+     * 食物格子不参与 hover，因此不需要保留 CompoundTag。
+     */
+    private static final class FoodCell {
+        private final String text;
+        private final int flag;
+        private int column;
         private int relY;
 
-        private FoodRow(String rawLeft, String rawRight) {
-            this.rawLeft = rawLeft;
-            this.rawRight = rawRight;
+        private FoodCell(String text, int flag) {
+            this.text = text;
+            this.flag = flag;
         }
     }
 }

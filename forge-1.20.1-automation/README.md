@@ -28,7 +28,7 @@ Minecraft **1.20.1 / Forge 47.2.0+ / Java 17** 附属模组：以「餐厅调度
 ```bash
 cd forge-1.20.1-automation
 ./gradlew build
-# 产物：build/libs/Maid Restaurant Automation-1.20.1-forge-1.0.0.jar
+# 产物：build/libs/Maid Restaurant Automation-1.20.1-forge-1.0.1.jar
 ```
 
 依赖 jar 放置于 `forge-1.20.1-automation/libs/`（`compileOnly`，不随模组打包）。
