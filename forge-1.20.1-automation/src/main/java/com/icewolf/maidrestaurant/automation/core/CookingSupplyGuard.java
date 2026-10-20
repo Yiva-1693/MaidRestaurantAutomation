@@ -21,17 +21,26 @@ import net.minecraft.tags.TagKey;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.crafting.Recipe;
+import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraftforge.items.IItemHandler;
 import net.minecraftforge.items.ItemHandlerHelper;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Set;
 
 /** 自动炒锅任务按配方补料，并把多余油脂退回可达仓库。 */
 public final class CookingSupplyGuard {
     private static final TagKey<Item> OIL = TagKey.create(Registries.ITEM,
             new ResourceLocation("kaleidoscope_cookery", "oil"));
     private static final String NEXT_OIL_RETURN = "maid_restaurant_automation:nextOilReturn";
+    private static final String OIL_RETURN_CURSOR = "maid_restaurant_automation:oilReturnCursor";
+    private static final int MAX_CANDIDATES_PER_CHECK = 64;
+    private static final int MAX_STORAGES_PER_CHECK = 4;
+    private static final int MAX_RETURNED_STACKS_PER_CHECK = 2;
 
     private CookingSupplyGuard() {
     }
@@ -73,17 +82,22 @@ public final class CookingSupplyGuard {
             ItemHandlerUtils.tryTakeFrom(level, pos, storage, inventory, predicate, count);
             return;
         }
+        List<Pair<StackPredicate, Integer>> requirements = missing(level, maid, request, true);
+        if (requirements.isEmpty()) return;
         IItemHandler source = storage.getHandler(level, pos);
         if (source == null || !storage.isValid(level, pos)) return;
-        for (int slot = 0; slot < source.getSlots() && count > 0; slot++) {
+        int sourceSlots = source.getSlots();
+        for (int slot = 0; slot < sourceSlots && count > 0; slot++) {
             ItemStack stored = source.getStackInSlot(slot);
             if (stored.isEmpty() || !predicate.test(stored)) continue;
             int needed = 0;
-            for (Pair<StackPredicate, Integer> requirement : missing(level, maid, request, true)) {
+            for (Pair<StackPredicate, Integer> requirement : requirements) {
                 if (requirement.left().test(stored)) needed += requirement.right();
             }
-            int take = Math.min(count, Math.min(needed, stored.getCount()));
-            if (take <= 0) continue;
+            if (needed <= 0) continue;
+            // 上游传入的缺口可能已过时，缩小本次预算，补齐后立即结束保险柜遍历。
+            count = Math.min(count, needed);
+            int take = Math.min(count, stored.getCount());
             ItemStack simulated = storage.extract(level, pos, slot, take, true);
             if (simulated.isEmpty() || !predicate.test(simulated)) continue;
             ItemStack offered = simulated.copyWithCount(Math.min(take, simulated.getCount()));
@@ -98,9 +112,16 @@ public final class CookingSupplyGuard {
             ItemStack toInsert = extracted.copyWithCount(boundedCount);
             ItemStack leftover = ItemHandlerHelper.insertItemStacked(inventory, toInsert, false);
             // 缓存数量再插入，不能依赖其他模组是否会修改传入的 ItemStack。
-            count -= boundedCount - leftover.getCount();
+            int inserted = boundedCount - leftover.getCount();
+            count -= inserted;
             restoreToStorage(level, pos, storage, inventory, maid, excess);
             restoreToStorage(level, pos, storage, inventory, maid, leftover);
+            if (count <= 0) break;
+            // 仅在背包实际发生变化后重算，不能对保险柜的每个槽位重复解析配方。
+            if (inserted > 0) {
+                requirements = missing(level, maid, request, true);
+                if (requirements.isEmpty()) break;
+            }
         }
     }
 
@@ -110,6 +131,8 @@ public final class CookingSupplyGuard {
         if (request == null || request.remain <= 0) return;
         long now = level.getGameTime();
         if (now < maid.getPersistentData().getLong(NEXT_OIL_RETURN)) return;
+        // 无需退料时也节流，避免每轮调度都重新计算配方与背包。
+        maid.getPersistentData().putLong(NEXT_OIL_RETURN, now + 40L);
         // 配方失效时不据此退料，交给本体清理请求。
         if (level.getRecipeManager().byKey(request.id).isEmpty()) return;
         IItemHandler inventory = maid.getAvailableInv(false);
@@ -133,24 +156,42 @@ public final class CookingSupplyGuard {
             total += surplus[slot];
         }
         if (total <= 0) return;
-        // 无空位的仓库隔两秒重试，避免满背包时每轮遍历整个取料范围。
-        maid.getPersistentData().putLong(NEXT_OIL_RETURN, now + 40L);
         BlockPos center = maid.isHomeModeEnable() ? maid.getRestrictCenter() : maid.blockPosition().below();
         int radius = Math.max(0, (int) maid.getRestrictRadius());
+        List<BlockPos> candidates = loadedStorageCandidates(level, center, radius, maid.blockPosition());
+        if (candidates.isEmpty()) return;
+        int cursor = Math.floorMod(maid.getPersistentData().getInt(OIL_RETURN_CURSOR), candidates.size());
+        Set<IItemHandler> visited = Collections.newSetFromMap(new IdentityHashMap<>());
         int remaining = total;
-        for (BlockPos pos : BlockPos.betweenClosed(center.offset(-radius, -2, -radius),
-                center.offset(radius, 2, radius))) {
+        int storages = 0;
+        int returnedStacks = 0;
+        for (int checked = 0; checked < Math.min(candidates.size(), MAX_CANDIDATES_PER_CHECK)
+                && storages < MAX_STORAGES_PER_CHECK; checked++) {
+            int candidateIndex = cursor;
+            BlockPos pos = candidates.get(candidateIndex);
+            cursor = (cursor + 1) % candidates.size();
+            maid.getPersistentData().putInt(OIL_RETURN_CURSOR, cursor);
             if (!level.isLoaded(pos)) continue;
             IMaidStorage storage = MaidStorages.tryGetType(level, pos);
             // 餐桌同样注册为可取料存储，但多余油脂不能被当成菜品摆上餐桌。
             if (storage == null || "TableStorage".equals(storage.getUID())) continue;
+            IItemHandler destination = storage.getHandler(level, pos);
+            // 多方块保险柜可能从多个方块暴露同一个背包，一轮只尝试一次。
+            if (destination == null || destination == inventory || !visited.add(destination)) continue;
+            storages++;
+            List<ItemStack> rejectedTypes = new ArrayList<>();
             for (int slot = 0; slot < inventory.getSlots() && remaining > 0; slot++) {
                 if (surplus[slot] <= 0) continue;
                 ItemStack sample = inventory.extractItem(slot, surplus[slot], true);
                 if (sample.isEmpty()) continue;
+                if (rejectedTypes.stream().anyMatch(stack -> ItemStack.isSameItemSameTags(stack, sample))) continue;
                 ItemStack rejected = storage.insert(level, pos, sample.copy(), true);
                 int accepted = sample.getCount() - rejected.getCount();
-                if (accepted <= 0) continue;
+                if (accepted <= 0) {
+                    // 满仓已拒收这种油脂，不再为背包里每一组相同油脂扫描整座保险柜。
+                    rejectedTypes.add(sample.copy());
+                    continue;
+                }
                 ItemStack extracted = inventory.extractItem(slot, accepted, false);
                 int extractedCount = extracted.getCount();
                 ItemStack leftover = storage.insert(level, pos, extracted, false);
@@ -158,13 +199,45 @@ public final class CookingSupplyGuard {
                 surplus[slot] -= moved;
                 remaining -= moved;
                 restoreToMaid(maid, inventory, leftover);
+                if (moved <= 0) rejectedTypes.add(sample.copy());
+                if (moved > 0 && ++returnedStacks >= MAX_RETURNED_STACKS_PER_CHECK) {
+                    // 分轮清理满背包，下轮优先继续使用刚才成功接收的仓库。
+                    maid.getPersistentData().putInt(OIL_RETURN_CURSOR, candidateIndex);
+                    break;
+                }
             }
-            if (remaining <= 0) break;
+            if (remaining <= 0 || returnedStacks >= MAX_RETURNED_STACKS_PER_CHECK) break;
         }
         if (remaining < total) {
             MaidRestaurantAutomation.LOGGER.debug("自动炒锅退回多余油脂：女仆={} 数量={}",
                     maid.getName().getString(), total - remaining);
         }
+    }
+
+    /** 只枚举已加载区块中的方块实体，不逐个检查搜索范围内的空气和普通方块。 */
+    private static List<BlockPos> loadedStorageCandidates(ServerLevel level, BlockPos center,
+                                                          int radius, BlockPos maidPos) {
+        List<BlockPos> candidates = new ArrayList<>();
+        int minX = center.getX() - radius;
+        int maxX = center.getX() + radius;
+        int minZ = center.getZ() - radius;
+        int maxZ = center.getZ() + radius;
+        for (int chunkX = minX >> 4; chunkX <= (maxX >> 4); chunkX++) {
+            for (int chunkZ = minZ >> 4; chunkZ <= (maxZ >> 4); chunkZ++) {
+                LevelChunk chunk = level.getChunkSource().getChunkNow(chunkX, chunkZ);
+                if (chunk == null) continue;
+                for (BlockPos pos : chunk.getBlockEntities().keySet()) {
+                    if (pos.getX() >= minX && pos.getX() <= maxX
+                            && pos.getZ() >= minZ && pos.getZ() <= maxZ
+                            && Math.abs(pos.getY() - center.getY()) <= 2) {
+                        candidates.add(pos.immutable());
+                    }
+                }
+            }
+        }
+        candidates.sort(Comparator.comparingDouble((BlockPos pos) -> pos.distSqr(maidPos))
+                .thenComparingLong(BlockPos::asLong));
+        return candidates;
     }
 
     private static void restoreToStorage(ServerLevel level, BlockPos pos, IMaidStorage storage,
