@@ -4,6 +4,7 @@
   "package": "com.icewolf.maidrestaurant.automation.mixin",
   "compatibilityLevel": "JAVA_17",
   "mixins": [
+    "MaidGetFromStorageTaskMixin",
     "MaidCookingTaskMixin",
     "StockpotCookTaskMixin",
     "TaskWaiterMixin",

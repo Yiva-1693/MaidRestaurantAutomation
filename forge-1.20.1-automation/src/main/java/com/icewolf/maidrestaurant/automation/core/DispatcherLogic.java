@@ -178,6 +178,17 @@ public final class DispatcherLogic {
         Map<UUID, EntityMaid> byUuid = new HashMap<>();
         for (EntityMaid maid : localMaids) {
             byUuid.put(maid.getUUID(), maid);
+            if (be.getBindingsMap().containsKey(maid.getUUID())) {
+                try {
+                    CookingSupplyGuard.returnSurplusOil(level, maid);
+                } catch (RuntimeException exception) {
+                    if (com.icewolf.maidrestaurant.automation.util.LogThrottle.allow(
+                            "return-surplus-oil-" + maid.getUUID(), level.getGameTime())) {
+                        com.icewolf.maidrestaurant.automation.MaidRestaurantAutomation.LOGGER.warn(
+                                "女仆 {} 退回多余油脂失败，保留其他调度流程", maid.getName().getString(), exception);
+                    }
+                }
+            }
         }
 
         // 0) 上岗女仆卡住自动脱困：去取菜/去工位途中被其它女仆挡住时，沿目标方向小步"穿过"，
